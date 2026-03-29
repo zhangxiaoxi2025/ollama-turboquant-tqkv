@@ -1,0 +1,25 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Cargo lock files (we track workspace Cargo.lock per-crate locks)
+# /Cargo.lock is gitignored - each crate has its own
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive
+.env
+*.pem
+*.key
+
+# Misc
+*.log
