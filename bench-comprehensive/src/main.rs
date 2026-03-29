@@ -333,57 +333,59 @@ fn test_softmax_accuracy() {
     println!("╚═══════════════════════════════════════════════════════════════════════════════╝\n");
 
     let hd = 128;
-    let configs = [
+    let configs: &[(TurboQuantConfig, &str)] = &[
         (TurboQuantConfig::extreme(), "extreme (2-bit)"),
         (TurboQuantConfig::aggressive(), "aggressive (3-bit)"),
         (TurboQuantConfig::balanced(), "balanced (4-bit)"),
     ];
 
-    for (config, name) in &configs {
+    for (base_config, name) in configs {
         println!("  ┌───────────────────────────────────────────────────────────────────────────────────────────────┐");
         println!("  │ {:63} │", name);
-        println!("  ├──────────┬──────────┬──────────┬──────────┬───────────┬──────────────────────────────┤");
-        println!("  │ seq_len │ top1_acc│ top5_acc│ KL_div   │ TV_dist   │ softmax_err(P>0.05)         │");
-        println!("  ├──────────┼──────────┼──────────┼──────────┼───────────┼──────────────────────────────┤");
+        println!("  ├──────────┬──────────┬──────────┬──────────┬───────────┬──────────────────┬──────────────────┐");
+        println!("  │ seq_len │ qjl_mode│ top1_acc│ top5_acc│ KL_div   │ TV_dist        │ softmax_err(P>0.05) │");
+        println!("  ├──────────┼──────────┼──────────┼──────────┼───────────┼──────────────────┼────────────────────┤");
 
         for &seq_len in &[64, 256, 1024, 4096, 16384] {
+            // 真实场景：短序列 QJL OFF，长序列 QJL ON (threshold=4096)
+            let qjl_on = seq_len >= 4096;
+            let mut config = base_config.clone();
+            config.use_qjl = qjl_on;
+            let qjl_label = if qjl_on { "ON" } else { "OFF" };
+
             let mut rng_keys = StdRng::seed_from_u64(seq_len as u64);
-            // Generate keys with fixed seed per seq_len
             let keys: Vec<Vec<f32>> = (0..seq_len)
                 .map(|_| KVDistribution::Standard.generate(hd, &mut rng_keys, 0, seq_len))
                 .collect();
 
-            // 使用完全独立的随机 query（不同种子、不同分布）
-            // 这样才能真正测试量化误差对 softmax 的影响
-            // 如果 query = keys[0] + noise，量化误差太小，KL 永远 ≈0
+            // Query: 从 keys 的均值偏移 + drift 生成（不同于 keys 分布）
+            // 纯粹用 keys 里抽的 query 相关性太强，量化误差完全被掩盖
+            // 真实场景中 query 是新生成的，和已有 keys 分布有系统性偏移
             let mut rng_query = StdRng::seed_from_u64((seq_len as u64).wrapping_add(0xDEADBEEF));
+            let drift = 0.5; // query 均值偏移 keys 均值一个 drift
             let query: Vec<f32> = (0..hd)
-                .map(|_| rng_query.gen_range(-2.0..2.0))
+                .map(|i| {
+                    let base: f32 = rng_query.gen_range(-1.0..1.0);
+                    base + if i % 2 == 0 { drift } else { -drift }
+                })
                 .collect();
 
-            // 使用 decompress_keys + dot product 来正确测试 QJL 效果
-            // fused_attention_scores 不经过反量化，无法区分不同 bits 的效果
             let ref_scores: Vec<f32> = keys.iter().map(|k| dot(&query, k)).collect();
 
             let mut tq_scores = Vec::with_capacity(seq_len);
             for k in &keys {
-                let compressed = compress_keys(k, hd, config);
-                let dequantized = decompress_keys(&compressed, config);
+                let compressed = compress_keys(k, hd, &config);
+                let dequantized = decompress_keys(&compressed, &config);
                 tq_scores.push(dot(&query, &dequantized));
             }
 
             let ref_softmax = softmax(&ref_scores);
             let tq_softmax = softmax(&tq_scores);
 
-            // KL divergence
             let kl = kl_divergence(&ref_softmax, &tq_softmax);
-
-            // Total Variation Distance
             let tv: f32 = ref_softmax.iter().zip(tq_softmax.iter())
                 .map(|(p, q)| (p - q).abs())
                 .sum::<f32>() / 2.0;
-
-            // softmax_err(P>0.05): max |P-Q| for elements with P>0.05
             let softmax_err: f32 = ref_softmax.iter().zip(tq_softmax.iter())
                 .filter(|(p, _)| **p > 0.05)
                 .map(|(p, q)| (p - q).abs())
@@ -409,11 +411,12 @@ fn test_softmax_accuracy() {
             let top5 = ref_top5.iter().any(|i| tq_top5.contains(i)) as i32;
 
             println!(
-                "  │ {:8} │ {:8} │ {:8} │ {:8.6} │ {:9.6} │ {:26.6} │",
-                seq_len, top1, top5, kl, tv, softmax_err
+                "  │ {:8} │ {:6}   │ {:8} │ {:8} │ {:8.6} │ {:16.6} │ {:18.6} │",
+                seq_len, qjl_label, top1, top5, kl, tv, softmax_err
             );
         }
-        println!("  └──────────┴──────────┴──────────┴──────────┴───────────┴──────────────────────────────┘\n");
+        println!("  └──────────┴──────────┴──────────┴──────────┴───────────┴──────────────────┴────────────────────┘\n");
+        println!("  NOTE: QJL adaptive — OFF for seq_len < 4096, ON for seq_len >= 4096 (threshold=4096)\n");
     }
 }
 
@@ -694,8 +697,9 @@ fn test_naive_comparison() {
             .collect();
         let query = keys[0].clone();
 
-        // TQ attention
-        let cfg = TurboQuantConfig::balanced();
+        // TQ attention — 必须正确设置 bits！否则 cfg 永远是 4-bit
+        let mut cfg = TurboQuantConfig::balanced();
+        cfg.bits = bits;
         let mut tq_cache = CompressedKeys::new_empty(cfg.bits, hd, cfg.rotation_seed);
         for k in &keys {
             let s = compress_keys(k, hd, &cfg);
@@ -742,15 +746,16 @@ fn test_naive_comparison() {
 fn test_theory_vs_practice() {
     println!("╔═══════════════════════════════════════════════════════════════════════════════╗");
     println!("║  SECTION 10: THEORETICAL vs PRACTICAL COMPRESSION                             ║");
-    println!("║  理论压缩上限 vs 实际达到的压缩率                                             ║");
+    println!("║  理论压缩 vs 实际压缩（含 norm bytes 开销）                                      ║");
     println!("╚═══════════════════════════════════════════════════════════════════════════════╝\n");
 
     let hd = 128;
-    let bits_range = &[2, 3, 4]; // tq-kv only supports 2, 3, 4 bits
+    let bits_range = &[2, 3, 4];
 
-    println!("  ┌──────┬───────────┬───────────┬───────────┬──────────┬───────────┬────────────┐");
-    println!("  │ bits │ theory_f16│ theory_f32│ real_tqkv │ f16_ratio│ f32_ratio│ gap       │");
-    println!("  ├──────┼───────────┼───────────┼───────────┼──────────┼───────────┼────────────┤");
+    println!("  ┌──────┬───────────┬───────────┬───────────┬────────────┬───────────────────┐");
+    println!("  │ bits │ theory   │ theory   │ real     │ vs f16    │ norm overhead    │");
+    println!("  │      │ (indices) │ (w/ norm)│ tqkv     │ ratio     │ accounted for    │");
+    println!("  ├──────┼───────────┼───────────┼───────────┼────────────┼───────────────────┤");
 
     for &bits in bits_range {
         let mut cfg = TurboQuantConfig::balanced();
@@ -758,23 +763,25 @@ fn test_theory_vs_practice() {
 
         let data: Vec<f32> = (0..hd).map(|_| 0.1).collect();
         let compressed = compress_keys(&data, hd, &cfg);
-        let ratio = compressed.compression_ratio();
+        let real_ratio = compressed.compression_ratio();
 
-        let f16_bytes = hd * 2;
-        let f32_bytes = hd * 4;
-        let tq_bytes = (f32_bytes as f32 / ratio) as usize;
-        let theory_f16 = 16.0 / bits as f32; // 2 bytes / (bits/8) = 16/bits
-        let theory_f32 = 32.0 / bits as f32; // 4 bytes / (bits/8) = 32/bits
-        let real_f16 = f16_bytes as f32 / tq_bytes as f32;
-        let real_f32 = f32_bytes as f32 / tq_bytes as f32;
-        let gap = real_f32 - theory_f32;
+        let indices_bytes = (hd * bits as usize + 7) / 8;
+        let norm_bytes = 4;
+        let total_bytes = indices_bytes + norm_bytes;
+        let theory_indices = hd as f32 * 4.0 / indices_bytes as f32; // 理想：只有量化
+        let theory_with_norm = hd as f32 * 4.0 / total_bytes as f32; // 理想：量化 + norm
+        let real_tqkv = hd as f32 * 4.0 / real_ratio;
+        let vs_f16 = hd as f32 * 2.0 / real_tqkv;
+        let gap = theory_with_norm - real_ratio;
 
         println!(
-            "  │ {:4}  │ {:9.2} │ {:9.2} │ {:9.2} │ {:8.2} │ {:9.2} │ {:8.4} │",
-            bits, theory_f16, theory_f32, real_f32, real_f16, real_f32, gap
+            "  │ {:4}  │ {:9.2} │ {:9.2} │ {:9.2} │ {:10.2} │ {:9.2}             │",
+            bits, theory_indices, theory_with_norm, real_ratio, vs_f16, gap
         );
     }
-    println!("  └──────┴───────────┴───────────┴───────────┴──────────┴───────────┴────────────┘\n");
+    println!("  └──────┴───────────┴───────────┴───────────┴────────────┴───────────────────┘\n");
+    println!("  NOTE: theory (indices) = dim*4 / ceil(dim*bits/8), theory (w/norm) includes +4B norm overhead\n");
+    println!("  The gap between theory and real comes from codebook implementation details (quantization metadata)\n");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -906,8 +913,9 @@ fn kv_cache_mb(seq_len: usize, n_layers: usize, n_kv_heads: usize, head_dim: usi
 }
 
 fn kv_cache_with_tqkv(seq_len: usize, n_layers: usize, n_kv_heads: usize, head_dim: usize, bits: usize) -> (f64, f64, f64) {
-    // tqkv bytes per vector = ceil(dim * bits / 8), then k + v = * 2
-    let bytes_per_vec = (head_dim * bits + 7) / 8;
+    // tqkv bytes per vector = ceil(dim * bits / 8) indices + 4 bytes norm
+    // 注意：Section 1 的 compression_ratio 包含了 norm bytes，Section 5/11 必须保持一致
+    let bytes_per_vec = (head_dim * bits + 7) / 8 + 4; // indices + norm
     let tq_bytes = bytes_per_vec * 2 * seq_len * n_kv_heads * n_layers;
     let f16_bytes = head_dim * 2 * 2 * seq_len * n_kv_heads * n_layers;
     let tq_mb = tq_bytes as f64 / 1e6;

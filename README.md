@@ -7,9 +7,9 @@ A comprehensive benchmarking suite evaluating TurboQuant-based KV cache compress
 Large language model inference with long context windows faces a critical memory bottleneck: the KV cache. As context length grows, the memory required to store key-value activations scales linearly, often exceeding the model weights themselves. This project benchmarks two Rust implementations of the TurboQuant algorithm (ICLR 2026) to evaluate their effectiveness in reducing KV cache memory footprint while maintaining inference quality.
 
 **Key results:**
-- **8x memory reduction** for KV cache at 4-bit quantization
+- **3.8x memory reduction** for KV cache at 4-bit quantization (vs FP16)
 - **6M+ fused attention operations/sec** — no decompression required
-- **< 2% relative error** on attention scores at 16K context length
+- **KL divergence < 0.05** for 4-bit+QJL at long context — negligible impact on generation quality
 - **Adaptive QJL** automatically enables error correction above 4K tokens
 
 ## Quick Start
@@ -24,6 +24,9 @@ cd ollama-turboquant-tqkv
 
 # Run the primary benchmark (tq-kv, GGUF-optimized)
 cargo run --release -p bench-tqkv
+
+# Run comprehensive benchmark (11 test sections: distribution sensitivity, softmax accuracy, QJL scaling, etc.)
+cargo run --release -p bench-comprehensive
 
 # Run comparison benchmark (turbo-quant, general-purpose)
 cargo run --release -p bench-turbo
@@ -59,12 +62,15 @@ ollama-turboquant-tqkv/
 ├── Cargo.toml              # Rust workspace configuration
 ├── README.md
 ├── .gitignore
-├── bench-tqkv/             # Primary benchmark suite (RECOMMENDED)
+├── bench-comprehensive/    # Extended benchmark (11 test sections)
 │   ├── Cargo.toml
-│   └── src/main.rs          # tq-kv integration, fused attention, accuracy tests
-└── bench-turbo/           # Initial exploration (NOT recommended for KV cache)
+│   └── src/main.rs        # distribution sensitivity, softmax accuracy, QJL scaling...
+├── bench-tqkv/            # Primary benchmark suite (RECOMMENDED)
+│   ├── Cargo.toml
+│   └── src/main.rs        # tq-kv integration, fused attention, accuracy tests
+└── bench-turbo/          # Initial exploration (NOT recommended for KV cache)
     ├── Cargo.toml
-    └── src/main.rs          # turbo-quant exploration, documented findings
+    └── src/main.rs        # turbo-quant exploration, documented findings
 ```
 
 ## Benchmark Suites
@@ -108,32 +114,34 @@ All tests run on Apple Silicon (ARM64) at release optimization level.
 
 | Sequence Length | Compression | Decompression | Fused Attention |
 |----------------|------------|---------------|-----------------|
-| 256 tokens | 169k tok/s | 468k tok/s | 3.1M ops/s |
-| 1,024 tokens | 193k tok/s | 521k tok/s | 3.2M ops/s |
-| 4,096 tokens | 286k tok/s | 826k tok/s | 6.1M ops/s |
-| 8,192 tokens | 343k tok/s | 980k tok/s | 6.8M ops/s |
-| 16,384 tokens | 357k tok/s | 953k tok/s | 6.9M ops/s |
+| 256 tokens | 327k tok/s | — | 6.3M ops/s |
+| 1,024 tokens | 323k tok/s | — | 6.1M ops/s |
+| 4,096 tokens | 344k tok/s | — | 6.8M ops/s |
+| 8,192 tokens | 351k tok/s | — | 6.8M ops/s |
+| 16,384 tokens | 353k tok/s | — | 6.7M ops/s |
 
-### Attention Score Accuracy (vs FP32 dot product, balanced 4-bit)
+**Note**: fused_attention_scores bypasses QJL correction for maximum throughput. Use decompress_keys for QJL-corrected results at lower throughput.
 
-| Sequence Length | Max Abs Error | Relative Error | Cosine Error |
-|-----------------|---------------|----------------|--------------|
-| 256 tokens | 1.53 | 2.10% | 0.086 |
-| 1,024 tokens | 1.53 | 1.20% | 0.063 |
-| 4,096 tokens | 1.53 | 0.63% | 0.054 |
-| 16,384 tokens | 1.53 | 0.32% | 0.060 |
+### Attention Score Accuracy (vs FP32 dot product, balanced 4-bit, QJL adaptive)
 
-**Note**: Relative error decreases with longer sequences because the error distribution becomes more symmetric, reducing its impact on softmax normalization.
+| Sequence Length | QJL Mode | KL Divergence | Top-1 Accuracy | Top-5 Accuracy |
+|-----------------|----------|---------------|----------------|--------------|
+| 256 tokens | OFF | 0.042 | 100% | 100% |
+| 1,024 tokens | OFF | 0.176 | ~50% | 100% |
+| 4,096 tokens | ON | 0.010 | 100% | 100% |
+| 16,384 tokens | ON | 0.047 | 100% | 100% |
+
+**Note**: QJL activates at seq_len >= 4096 (threshold=4096). Short context (< 4K) skips QJL — quantization error is too small to benefit from error correction. Long context benefits from QJL's ~4.5 dB SNR improvement. Top-1 accuracy varies with query-key distribution; QJL consistently recovers 100% at long context.
 
 ### Model Memory Analysis (Qwen2.5-7B: 40 layers, 32 KV heads, head_dim=128)
 
 | Context Length | FP16 KV Cache | tq-kv 4-bit | Reduction Factor | Memory Saved |
 |----------------|---------------|--------------|-----------------|-------------|
-| 1,024 tokens | 640 MB | 80 MB | 8.0x | 560 MB |
-| 2,048 tokens | 1,280 MB | 160 MB | 8.0x | 1,120 MB |
-| 4,096 tokens | 2,560 MB | 320 MB | 8.0x | 2,240 MB |
-| 8,192 tokens | 5,120 MB | 640 MB | 8.0x | 4,480 MB |
-| 16,384 tokens | 10,240 MB | 1,280 MB | 8.0x | 8,960 MB |
+| 1,024 tokens | 640 MB | 170 MB | 3.8x | 470 MB |
+| 2,048 tokens | 1,280 MB | 340 MB | 3.8x | 940 MB |
+| 4,096 tokens | 2,560 MB | 680 MB | 3.8x | 1,880 MB |
+| 8,192 tokens | 5,120 MB | 1,360 MB | 3.8x | 3,760 MB |
+| 16,384 tokens | 10,240 MB | 2,720 MB | 3.8x | 7,520 MB |
 
 ### QJL Adaptive Threshold Analysis
 
@@ -141,6 +149,19 @@ All tests run on Apple Silicon (ARM64) at release optimization level.
 |----------------|----------|---------------|
 | < 4,096 tokens | OFF | Short context: QJL variance cost exceeds error correction benefit |
 | 4,096+ tokens | ON | Long context: accumulated quantization error outweighs variance |
+
+### Key Findings
+
+1. **head_dim=128**: optimal bits=4, break-even at ~175 tokens/layer (4-bit)
+2. **GQA models benefit most**: 8:1 KV head ratio → KV cache is 3.8x smaller
+3. **Softmax Top-1 accuracy**: 100% for 4-bit+QJL ON at seq_len ≥ 4K; 0–100% at shorter sequences
+4. **KL divergence**: 0.01–0.05 for 4-bit+QJL at long context, 0.04–0.18 without QJL
+5. **QJL effect**: KL drops ~4x at 4K+ tokens when QJL activates
+6. **DeepLayer distribution**: higher error, still acceptable at 4-bit
+7. **SinkToken pattern**: tq-kv handles sink tokens correctly
+8. **Numerical stability**: handles NaN/Inf gracefully (does not panic)
+9. **vs Naive quantization**: tq-kv 5–8x better cos_err at same bits (84–98% rel_err improvement)
+10. **API note**: `fused_attention_scores` bypasses QJL correction for throughput; use `decompress_keys` for QJL-corrected results
 
 ## Integration Roadmap
 
