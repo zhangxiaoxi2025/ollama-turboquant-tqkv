@@ -3,13 +3,14 @@ resolver = "2"
 members = [
     "bench-tqkv",
     "bench-turbo",
+    "bench-comprehensive",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["老王"]
+authors = ["zhangxiaoxi2025"]
 description = "TurboQuant KV Cache Compression Benchmarks for Ollama × GGUF"
 license = "MIT"
-repository = "https://github.com/YOUR_USERNAME/ollama-turbo"
+repository = "https://github.com/zhangxiaoxi2025/ollama-turboquant-tqkv"
 keywords = ["llm", "kv-cache", "turboquant", "quantization", "ollama"]
