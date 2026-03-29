@@ -25,9 +25,12 @@ use tq_kv::{
 // ═══════════════════════════════════════════════════════════
 
 /// Model architecture profiles
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct ModelProfile {
     name: &'static str,
     n_layers: usize,
+    #[allow(dead_code)]
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -344,28 +347,30 @@ fn test_softmax_accuracy() {
         println!("  ├──────────┼──────────┼──────────┼──────────┼───────────┼──────────────────────────────┤");
 
         for &seq_len in &[64, 256, 1024, 4096, 16384] {
-            let mut rng = StdRng::seed_from_u64(seq_len as u64);
+            let mut rng_keys = StdRng::seed_from_u64(seq_len as u64);
             // Generate keys with fixed seed per seq_len
             let keys: Vec<Vec<f32>> = (0..seq_len)
-                .map(|_| KVDistribution::Standard.generate(hd, &mut rng, 0, seq_len))
+                .map(|_| KVDistribution::Standard.generate(hd, &mut rng_keys, 0, seq_len))
                 .collect();
 
-            // Query = key[0] + small noise (more realistic)
-            let mut query = keys[0].clone();
-            for v in &mut query {
-                *v += rng.gen_range(-0.1..0.1);
-            }
+            // 使用完全独立的随机 query（不同种子、不同分布）
+            // 这样才能真正测试量化误差对 softmax 的影响
+            // 如果 query = keys[0] + noise，量化误差太小，KL 永远 ≈0
+            let mut rng_query = StdRng::seed_from_u64((seq_len as u64).wrapping_add(0xDEADBEEF));
+            let query: Vec<f32> = (0..hd)
+                .map(|_| rng_query.gen_range(-2.0..2.0))
+                .collect();
 
-            let mut cache = CompressedKeys::new_empty(config.bits, hd, config.rotation_seed);
-            for k in &keys {
-                let single = compress_keys(k, hd, config);
-                cache.append_raw(&single.packed_indices[..single.bytes_per_vector()], single.norms[0]);
-            }
-
+            // 使用 decompress_keys + dot product 来正确测试 QJL 效果
+            // fused_attention_scores 不经过反量化，无法区分不同 bits 的效果
             let ref_scores: Vec<f32> = keys.iter().map(|k| dot(&query, k)).collect();
-            let rotated_q = pre_rotate_query(&query, config.rotation_seed);
-            let centroids = codebook::get_centroids(config.bits);
-            let tq_scores = fused_attention_scores(&rotated_q, &cache, centroids, 1.0);
+
+            let mut tq_scores = Vec::with_capacity(seq_len);
+            for k in &keys {
+                let compressed = compress_keys(k, hd, config);
+                let dequantized = decompress_keys(&compressed, config);
+                tq_scores.push(dot(&query, &dequantized));
+            }
 
             let ref_softmax = softmax(&ref_scores);
             let tq_softmax = softmax(&tq_scores);
@@ -436,15 +441,14 @@ fn test_model_memory_profiles() {
             model.head_dim,
         );
 
-        let f16_4k = kv_cache_mb(4096, layers, kv_heads, hd, 2);
+        let _f16_4k = kv_cache_mb(4096, layers, kv_heads, hd, 2);
         let f16_16k = kv_cache_mb(16384, layers, kv_heads, hd, 2);
-        let (tq_4k, _saving) = kv_cache_with_tqkv(4096, layers, kv_heads, hd);
-        let ratio = f16_4k / tq_4k;
-        let saved_mb = f16_4k - tq_4k;
+        let (tq_4k, f16_4k_real, _saved_4k) = kv_cache_with_tqkv(4096, layers, kv_heads, hd, 4);
+        let ratio = f16_4k_real / tq_4k;
 
         println!(
             "  │ {:16} │ {:5}L │ {:8.0}MB │ {:8.0}MB │ {:7.1}MB ({:.1}x) │",
-            params, layers, f16_4k, f16_16k, tq_4k, ratio
+            params, layers, f16_4k_real, f16_16k, tq_4k, ratio
         );
     }
     println!("  └──────────────────┴──────────┴──────────┴──────────┴──────────────────────────┘\n");
@@ -534,7 +538,7 @@ fn test_qjl_scaling() {
 
     let hd = 128;
     let seq_len = 4096;
-    let projection_dims = &[8, 16, 32, 64, 128, 256, 512];
+    let projection_dims = &[8, 16, 32, 64, 128]; // qjl_proj_dim <= dim
 
     println!("  ┌──────────────┬───────────┬───────────┬───────────┬────────────────┐");
     println!("  │ qjl_proj_dim │ compress  │ fused_attn│ cos_err   │ rel_err        │");
@@ -547,36 +551,39 @@ fn test_qjl_scaling() {
             .map(|_| KVDistribution::Standard.generate(hd, &mut rng, 0, seq_len))
             .collect();
 
+        // 必须同时设置 use_qjl=true！qjl_mode 是给 should_use_qjl() 用的，
+        // 而 compress_keys() 直接读 use_qjl 字段
         let mut cfg = TurboQuantConfig::balanced();
         cfg.bits = 4;
         cfg.qjl_proj_dim = qjl_dim;
         cfg.qjl_mode = tq_kv::QjlMode::On;
+        cfg.use_qjl = true; // 关键！compress_keys 直接读这个字段
 
-        let mut cache = CompressedKeys::new_empty(cfg.bits, hd, cfg.rotation_seed);
-        for k in &keys {
-            let single = compress_keys(k, hd, &cfg);
-            cache.append_raw(&single.packed_indices[..single.bytes_per_vector()], single.norms[0]);
-        }
-
+        // 用 decompress_keys + dot product 来测试 QJL 效果
+        // fused_attention_scores 不经过反量化，不使用 QJL correction
         let query = keys[0].clone();
         let ref_scores: Vec<f32> = keys.iter().map(|k| dot(&query, k)).collect();
-        let rotated_q = pre_rotate_query(&query, cfg.rotation_seed);
-        let centroids = codebook::get_centroids(cfg.bits);
 
         let t0 = Instant::now();
-        let tq_scores = fused_attention_scores(&rotated_q, &cache, centroids, 1.0);
-        let fused_time = t0.elapsed();
-        let fused_ops = seq_len as f64 / fused_time.as_secs_f64();
+        let mut tq_scores = Vec::with_capacity(seq_len);
+        for k in &keys {
+            let compressed = compress_keys(k, hd, &cfg);
+            let dequantized = decompress_keys(&compressed, &cfg);
+            tq_scores.push(dot(&query, &dequantized));
+        }
+        let decomp_time = t0.elapsed();
+        let decomp_ops = seq_len as f64 / decomp_time.as_secs_f64();
 
         let (_, rel_err, _, cos_err, _) = analyze_errors(&ref_scores, &tq_scores);
 
         println!(
             "  │ {:12} │ {:9.0}  │ {:9.0}  │ {:9.4} │ {:14.4}% │",
-            qjl_dim, seq_len as f64 / 0.001, fused_ops, cos_err, rel_err * 100.0
+            qjl_dim, seq_len as f64 / 0.001, decomp_ops, cos_err, rel_err * 100.0
         );
     }
     println!("  └──────────────┴───────────┴───────────┴───────────┴────────────────┘\n");
-    println!("  NOTE: qjl_proj_dim controls QJL error correction quality (higher = better but slower)\n");
+    println!("  NOTE: qjl_proj_dim 越大精度越高，但 QJL correction 的效果由 SRHT 理论保证——JL 引理保证任意投影维度都能保持距离\n");
+    println!("  WARNING: fused_attention_scores 不经过反量化，QJL correction 只在 decompress_keys 时生效！\n");
 }
 // SECTION 9: NUMERICAL STABILITY
 // ═══════════════════════════════════════════════════════════
@@ -800,17 +807,14 @@ fn test_model_parameter_sensitivity() {
     println!("  ├─────────────────────────────┼─────────────────┼─────────────────┼──────────────┤");
 
     for &(_n_heads, n_kv, name) in gqa_ratios {
-        let f16_mb = kv_cache_mb(seq_len, n_layers, n_kv, hd, 2);
-        let (tq_mb, _) = kv_cache_with_tqkv(seq_len, n_layers, n_kv, hd);
-        let saving = f16_mb - tq_mb;
+        let (tq_mb, f16_mb, _saved) = kv_cache_with_tqkv(seq_len, n_layers, n_kv, hd, 4);
         let ratio = f16_mb / tq_mb;
-
-            let ratio_str = format!("{:.1}", ratio);
-            let saving_str = format!("{:.0}", saving);
-            println!(
-                "  │ {:25} │ {:10.0}MB     │ {:10.0}MB     │ {}x ({}MB) │",
-                name, f16_mb, tq_mb, ratio_str, saving_str
-            );
+        let ratio_str = format!("{:.1}", ratio);
+        let saving_str = format!("{:.0}", f16_mb - tq_mb);
+        println!(
+            "  │ {:25} │ {:10.1}MB     │ {:10.1}MB     │ {}x ({}MB) │",
+            name, f16_mb, tq_mb, ratio_str, saving_str
+        );
     }
     println!("  └─────────────────────────────┴─────────────────┴─────────────────┴──────────────┘\n");
 }
@@ -901,13 +905,14 @@ fn kv_cache_mb(seq_len: usize, n_layers: usize, n_kv_heads: usize, head_dim: usi
     bytes as f64 / 1e6
 }
 
-fn kv_cache_with_tqkv(seq_len: usize, n_layers: usize, n_kv_heads: usize, head_dim: usize) -> (f64, f64) {
-    // tq-kv 4-bit: head_dim / 2 bytes per token per key/value
-    let bytes_per_kv = head_dim / 2; // 4-bit = 64B at head_dim=128
-    let bytes = bytes_per_kv * 2 * seq_len * n_kv_heads * n_layers;
-    let tq_mb = bytes as f64 / 1e6;
-    let f16_mb = kv_cache_mb(seq_len, n_layers, n_kv_heads, head_dim, 2);
-    (tq_mb, f16_mb - tq_mb)
+fn kv_cache_with_tqkv(seq_len: usize, n_layers: usize, n_kv_heads: usize, head_dim: usize, bits: usize) -> (f64, f64, f64) {
+    // tqkv bytes per vector = ceil(dim * bits / 8), then k + v = * 2
+    let bytes_per_vec = (head_dim * bits + 7) / 8;
+    let tq_bytes = bytes_per_vec * 2 * seq_len * n_kv_heads * n_layers;
+    let f16_bytes = head_dim * 2 * 2 * seq_len * n_kv_heads * n_layers;
+    let tq_mb = tq_bytes as f64 / 1e6;
+    let f16_mb = f16_bytes as f64 / 1e6;
+    (tq_mb, f16_mb, f16_mb - tq_mb)
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
