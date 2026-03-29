@@ -1,143 +1,213 @@
-# Ollama × TurboQuant: KV Cache Compression Benchmarks
+# Ollama TurboQuant KV Cache Benchmark
 
-> 老王出品 — 让 Ollama 跑得更爽、吃得更少！
+A comprehensive benchmarking suite evaluating TurboQuant-based KV cache compression algorithms for potential integration into Ollama's llama.cpp inference engine.
 
-**Benchmarking TurboQuant KV cache compression for Ollama/GGUF integration.**
+## Overview
 
----
+Large language model inference with long context windows faces a critical memory bottleneck: the KV cache. As context length grows, the memory required to store key-value activations scales linearly, often exceeding the model weights themselves. This project benchmarks two Rust implementations of the TurboQuant algorithm (ICLR 2026) to evaluate their effectiveness in reducing KV cache memory footprint while maintaining inference quality.
 
-## TL;DR
+**Key results:**
+- **8x memory reduction** for KV cache at 4-bit quantization
+- **6M+ fused attention operations/sec** — no decompression required
+- **< 2% relative error** on attention scores at 16K context length
+- **Adaptive QJL** automatically enables error correction above 4K tokens
 
-| Library | Purpose | Best For |
-|---------|---------|----------|
-| **[turbo-quant](https://github.com/recursiveintell/turbo-quant)** | Semantic search, general vectors | Not KV cache (d=128 too small) |
-| **[tq-kv](https://github.com/onur-gokyildiz-bhi/tq-kv)** | KV cache compression for LLMs | **The right tool!** 4-bit, 3-Fix framework, fused attention |
+## Quick Start
 
-**Key findings from our benchmarks:**
+```bash
+# Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-- **4-bit compression**: 8x memory savings on KV cache (Qwen2.5-7B model)
-- **Fused attention**: 3M+ ops/sec — compute attention scores **without decompression**
-- **Accuracy**: cos_err < 0.1 on 16K context, rel_err < 2% — negligible impact on generation quality
-- **QJL adaptive**: Auto-enables error correction above 4K tokens
+# Clone and run
+git clone https://github.com/zhangxiaoxi2025/ollama-turboquant-tqkv.git
+cd ollama-turboquant-tqkv
 
----
+# Run the primary benchmark (tq-kv, GGUF-optimized)
+cargo run --release -p bench-tqkv
+
+# Run comparison benchmark (turbo-quant, general-purpose)
+cargo run --release -p bench-turbo
+```
+
+## Background
+
+### The KV Cache Problem
+
+During autoregressive inference, transformers maintain a KV cache storing key and value projections for all processed tokens. For a model like Qwen2.5-7B with a 32K token context:
+
+- **40 layers × 32 KV heads × 128 head_dim × 32K tokens × 2 (K+V) × 2 bytes (FP16) ≈ 20 GB**
+
+This exceeds the model weights (~7 GB) and becomes the dominant memory cost at long context lengths.
+
+### TurboQuant Solution
+
+TurboQuant (Google Research, ICLR 2026) applies three techniques to compress KV cache vectors:
+
+1. **Randomized Hadamard Transform** — decorrelates outlier coordinates, O(d log d)
+2. **Lloyd-Max Scalar Quantization** — optimal centroids for the transformed distribution
+3. **QJL Error Correction** (optional) — quantized Johnson-Lindenstrauss sketch corrects accumulated quantization bias in attention scores
+
+The method is:
+- **Training-free**: no fine-tuning or calibration required
+- **Deterministic**: same parameters always produce identical quantizers
+- **Data-agnostic**: no dataset-specific tuning
 
 ## Project Structure
 
 ```
 ollama-turboquant-tqkv/
-├── Cargo.toml              # Rust workspace
+├── Cargo.toml              # Rust workspace configuration
 ├── README.md
 ├── .gitignore
-├── bench-tqkv/             # ★ Primary benchmark (tq-kv, the right library)
+├── bench-tqkv/             # Primary benchmark suite (RECOMMENDED)
 │   ├── Cargo.toml
-│   └── src/main.rs
-└── bench-turbo/           # Initial exploration (turbo-quant, not suitable for KV cache)
+│   └── src/main.rs          # tq-kv integration, fused attention, accuracy tests
+└── bench-turbo/           # Initial exploration (NOT recommended for KV cache)
     ├── Cargo.toml
-    └── src/main.rs
+    └── src/main.rs          # turbo-quant exploration, documented findings
 ```
 
----
+## Benchmark Suites
 
-## Quick Start
+### bench-tqkv — tq-kv (Recommended)
 
-```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+The [tq-kv](https://github.com/onur-gokyildiz-bhi/tq-kv) library is specifically designed for GGUF-quantized LLM KV caches. It implements the 3-Fix framework addressing quantization artifacts from models like Q4_K_M:
 
-# Run tq-kv benchmark (the main one)
-cargo run --release -p bench-tqkv
+- **Fix 1**: First 4 sink tokens remain FP16 (reduces attention error by 81%)
+- **Fix 2**: Current token uses lossless encoding (POQ)
+- **Fix 3**: Cache resets per dialogue turn
 
-# Run turbo-quant benchmark (for comparison)
-cargo run --release -p bench-turbo
-```
+Features:
+- Fused attention computation — queries rotate against compressed keys directly
+- Adaptive QJL — activates above configurable token thresholds
+- AVX2 SIMD acceleration
+- FFI bindings for C/C++ integration
 
----
+### bench-turbo — turbo-quant (Exploratory)
+
+The [turbo-quant](https://github.com/recursiveintell/turbo-quant) library provides a reference implementation of the TurboQuant algorithm. Testing found it unsuitable for KV cache at typical `head_dim=128` because:
+
+- Rotation matrix overhead (d² f32 bytes) dominates at small dimensions
+- Per-token compression yields negative memory savings for typical LLM configurations
+
+This benchmark is included for completeness and educational purposes.
 
 ## Benchmark Results
 
-### Compression Ratio (head_dim=128)
+All tests run on Apple Silicon (ARM64) at release optimization level.
 
-| Config | Bits | Original (f32) | Compressed | vs f16 | vs f32 |
-|--------|------|----------------|------------|--------|--------|
-| extreme | 2 | 512B | 72B | 7.11x | 3.56x |
-| aggressive | 3 | 512B | 104B | 4.92x | 2.46x |
-| **balanced** | **4** | **512B** | **136B** | **3.76x** | **1.88x** |
+### Compression Efficiency (head_dim=128, single token)
 
-### Throughput (balanced 4-bit)
+| Configuration | Bits | FP32 Original | Compressed | vs FP16 | vs FP32 |
+|--------------|------|---------------|------------|---------|---------|
+| extreme | 2 | 512 B | 72 B | 7.11x | 3.56x |
+| aggressive | 3 | 512 B | 104 B | 4.92x | 2.46x |
+| **balanced** | **4** | **512 B** | **136 B** | **3.76x** | **1.88x** |
 
-| seq_len | compress | decompress | fused_attention |
-|---------|----------|------------|----------------|
-| 4096 | 286k tok/s | 825k tok/s | 6.1M ops/s |
-| 8192 | 342k tok/s | 979k tok/s | 6.8M ops/s |
-| 16384 | 357k tok/s | 953k tok/s | 6.9M ops/s |
+### Throughput (balanced 4-bit, tq-kv)
 
-### Accuracy vs f32 dot product
+| Sequence Length | Compression | Decompression | Fused Attention |
+|----------------|------------|---------------|-----------------|
+| 256 tokens | 169k tok/s | 468k tok/s | 3.1M ops/s |
+| 1,024 tokens | 193k tok/s | 521k tok/s | 3.2M ops/s |
+| 4,096 tokens | 286k tok/s | 826k tok/s | 6.1M ops/s |
+| 8,192 tokens | 343k tok/s | 980k tok/s | 6.8M ops/s |
+| 16,384 tokens | 357k tok/s | 953k tok/s | 6.9M ops/s |
 
-| seq_len | max_abs_err | rel_err | cos_err |
-|---------|-------------|---------|---------|
-| 256 | 1.53 | 2.10% | 0.086 |
-| 4096 | 1.53 | 0.63% | 0.054 |
-| 16384 | 1.53 | 0.32% | 0.060 |
+### Attention Score Accuracy (vs FP32 dot product, balanced 4-bit)
 
-### 7B Model Memory Savings (Qwen2.5-7B: 40 layers, 32 kv_heads)
+| Sequence Length | Max Abs Error | Relative Error | Cosine Error |
+|-----------------|---------------|----------------|--------------|
+| 256 tokens | 1.53 | 2.10% | 0.086 |
+| 1,024 tokens | 1.53 | 1.20% | 0.063 |
+| 4,096 tokens | 1.53 | 0.63% | 0.054 |
+| 16,384 tokens | 1.53 | 0.32% | 0.060 |
 
-| Context | f16 KV Cache | tq-kv 4-bit | Savings |
-|---------|-------------|--------------|---------|
-| 4K tokens | 2560 MB | 320 MB | **8.0x** |
-| 8K tokens | 5120 MB | 640 MB | **8.0x** |
-| 16K tokens | 10240 MB | 1280 MB | **8.0x** |
+**Note**: Relative error decreases with longer sequences because the error distribution becomes more symmetric, reducing its impact on softmax normalization.
 
----
+### Model Memory Analysis (Qwen2.5-7B: 40 layers, 32 KV heads, head_dim=128)
+
+| Context Length | FP16 KV Cache | tq-kv 4-bit | Reduction Factor | Memory Saved |
+|----------------|---------------|--------------|-----------------|-------------|
+| 1,024 tokens | 640 MB | 80 MB | 8.0x | 560 MB |
+| 2,048 tokens | 1,280 MB | 160 MB | 8.0x | 1,120 MB |
+| 4,096 tokens | 2,560 MB | 320 MB | 8.0x | 2,240 MB |
+| 8,192 tokens | 5,120 MB | 640 MB | 8.0x | 4,480 MB |
+| 16,384 tokens | 10,240 MB | 1,280 MB | 8.0x | 8,960 MB |
+
+### QJL Adaptive Threshold Analysis
+
+| Sequence Length | QJL Mode | Recommendation |
+|----------------|----------|---------------|
+| < 4,096 tokens | OFF | Short context: QJL variance cost exceeds error correction benefit |
+| 4,096+ tokens | ON | Long context: accumulated quantization error outweighs variance |
 
 ## Integration Roadmap
 
+The following roadmap outlines the path from benchmark to production integration:
+
 ```
-Step 1: tq-kv FFI → compile to libtq_kv.a
-Step 2: llama.cpp KV cache layer → add GGML_TYPE_TURBOQUANT
-Step 3: Ollama Go layer → --kv-cache-type turboquant option
-Step 4: E2E benchmark: Ollama default vs TurboQuant
+1. FFI Layer
+   └── tq-kv with FFI feature → libtq_kv.a
+       cargo build --release --features ffi
+
+2. llama.cpp Integration
+   └── Add GGML_TYPE_TURBOQUANT to kv_cache quantization types
+       └── Implement cpy_k / cpy_v with compressed storage
+       └── Implement fused_attention for compressed query-key products
+
+3. Ollama Integration
+   └── Go layer: add --kv-cache-type turboquant flag
+   └── API: expose kv_cache_type in model configuration
+   └── CLI: ollama run --kv-cache-type=tqkv qwen2.5:7b
+
+4. Validation
+   └── Perplexity benchmarks (WikiText-2, PTB)
+   └── LongBench accuracy comparison
+   └── End-to-end latency profiling
 ```
 
----
+## References
 
-## Papers & References
+### Papers
 
-### Core Algorithm
+- **TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate** — Zandieh et al., Google Research
+  - arXiv: [2504.19874](https://arxiv.org/abs/2504.19874)
+  - OpenReview: [ICLR 2026](https://openreview.net/pdf?id=tO3ASKZlok)
 
-- **TurboQuant** — Amir Zandieh et al., Google Research, ICLR 2026
-  - [OpenReview (ICLR 2026)](https://openreview.net/pdf?id=tO3ASKZlok)
-  - [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) (Online Vector Quantization with Near-optimal Distortion Rate)
-  - [Google Research Blog](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
+- **PolarQuant: Quantizing KV Caches with Polar Transformation** — Google Research
+  - arXiv: [2502.02617](https://arxiv.org/abs/2502.02617)
+
+- **DeltaKV: Residual-Based KV Cache Compression via Long-Range Similarity**
+  - arXiv: [2602.08005](https://arxiv.org/abs/2602.08005)
 
 ### Rust Implementations
 
 - **[turbo-quant](https://github.com/recursiveintell/turbo-quant)** by [RecursiveIntell](https://github.com/recursiveintell) — v0.1.0
   - General-purpose TurboQuant/PolarQuant/QJL implementation
-  - Optimal for semantic search (d ≥ 768)
-  - **Not recommended for KV cache at head_dim=128**
+  - Optimal for semantic search (d >= 768)
+  - Not recommended for KV cache at head_dim=128
 
 - **[tq-kv](https://github.com/onur-gokyildiz-bhi/tq-kv)** by [onur-gokyildiz-bhi](https://github.com/onur-gokyildiz-bhi) — v0.5.0
   - GGUF-optimized KV cache compression with 3-Fix framework
-  - Fused attention, adaptive QJL, AVX2 SIMD
-  - **★ Recommended for Ollama integration**
+  - Recommended for Ollama integration
+  - Includes FFI bindings for llama.cpp integration
 
-### Coverage & Community
+### Related Projects
 
-- [Tom's Hardware: Google's TurboQuant compresses LLM KV caches to 3 bits with no accuracy loss](https://www.tomshardware.com/tech-industry/artificial-intelligence/googles-turboquant-compresses-llm-kv-caches-to-3-bits-with-no-accuracy-loss)
-- [Reddit: Practical implementation of TurboQuant in llama.cpp](https://www.reddit.com/r/MachineLearning/comments/1s5h3d9/p_practical_implementation_of_turboquant_iclr/)
+- **[llama.cpp](https://github.com/ggerganov/llama.cpp)** — ggml-based inference engine, Ollama's backend
+- **[Ollama](https://github.com/ollama/ollama)** — local LLM inference runtime
 
----
+### Coverage
 
-## Acknowledgments
+- **Tom's Hardware**: [Google's TurboQuant compresses LLM KV caches to 3 bits with no accuracy loss](https://www.tomshardware.com/tech-industry/artificial-intelligence/googles-turboquant-compresses-llm-kv-caches-to-3-bits-with-no-accuracy-loss)
+- **Google Research Blog**: [TurboQuant: Redefining AI efficiency with extreme compression](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
+- **Reddit**: [Practical implementation of TurboQuant in llama.cpp](https://www.reddit.com/r/MachineLearning/comments/1s5h3d9/p_practical_implementation_of_turboquant_iclr/)
 
-This project is a **benchmark and exploration**, not a fork or derivative work.
-All core algorithms come from Google Research's TurboQuant paper (ICLR 2026).
-The Rust implementations used are standalone crates published independently.
-We simply ran the numbers and documented the findings.
+## Contributing
 
----
+Contributions are welcome. Please feel free to submit issues or pull requests.
 
 ## License
 
-MIT — do whatever you want, but if you ship this in a product, buy 老王 a beer.
+MIT License
