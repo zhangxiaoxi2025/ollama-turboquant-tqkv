@@ -859,18 +859,22 @@ fn qjl_dot_term(
     correction.alpha * rotated_q.iter().zip(sign_vec.iter()).map(|(&q, &s)| q * s).sum::<f32>()
 }
 
-/// Fused attention with two-term unbiased estimator: MSE + QJL.
-/// MSE_term = norm_k * <rotated_q, centroids>
-/// QJL_term = alpha * <rotated_q, H @ D @ signs>
-/// score = (MSE_term + QJL_term) / sqrt(d)
-/// Adaptive fused attention with QJL two-term routing.
+/// Adaptive fused attention with conditional QJL routing.
 ///
-/// Routing logic (based on benchmark Section 13 findings):
-///   • bits == 4 AND context_length >= 4096 → Two-term (MSE + QJL): 30-53% MSE improvement
-///   • bits < 4 (2-bit, 3-bit)            → MSE-only: QJL injects noise > correction at high error
+/// Routing logic:
+///   • bits == 4 AND context_length >= 4096 → Two-term (MSE + QJL): see Section 13 data
+///   • bits < 4 (2-bit, 3-bit)              → MSE-only: QJL disabled (see Section 13 for why)
+///   • bits == 4 AND context_length < 4096  → MSE-only: QJL compute not worth it
 ///
-/// This avoids the negative QJL compensation at low bitrates (2-bit: -75% MSE degradation)
-/// while capturing the full benefit at 4-bit for long-context scenarios.
+/// Section 13 benchmark data (seed=777):
+///   2-bit:  QJL always disabled  → routing correctly skips QJL
+///   3-bit:  QJL always disabled  → routing correctly skips QJL
+///   4-bit ctx < 4096: QJL disabled → routing correctly skips QJL
+///   4-bit ctx >= 4096: QJL enabled → Standard: +29.6%, DeepLayer: -10.9%, Sparse: -7.2%
+///
+/// Note: QJL improves Standard but HARMS DeepLayer/Sparse even at 4-bit.
+/// The routing enables QJL on the 4-bit+long-context sweet spot based on expected
+/// aggregate benefit. For production, per-layer distribution estimation could refine this.
 fn fused_attention_two_term(
     rotated_q: &[f32],
     cache: &CompressedKeys,
@@ -881,7 +885,8 @@ fn fused_attention_two_term(
     let bits = cache.bits;
     let use_qjl = bits == 4 && context_length >= 4096;
 
-    // Pre-generate D signs if QJL is enabled (shared across all keys, zero per-key allocation)
+    // Pre-generate D signs only when QJL is enabled (shared across all keys)
+    // When use_qjl=false, d_signs=None and qjl_dot_term always returns 0.0
     let d_signs = if use_qjl {
         cache.qjl_corrections.as_ref().map(|corrections| {
             hadamard::generate_signs(dim, corrections.first().map(|c| c.seed).unwrap_or(0))
@@ -919,10 +924,10 @@ fn fused_attention_two_term(
             .sum();
 
         // ── Step 3: QJL term (conditional) ──
-        // QJL is an unbiased estimator of quantization residual error.
-        // Benefit: +30-53% MSE reduction at 4-bit + long context.
-        // Cost: QJL injects noise at low bitrates (2-bit: -75% degradation).
-        // Decision: only enable when bits==4 AND context_length>=4096.
+        // QJL is an unbiased estimator of the quantization residual error.
+        // Section 13 benchmark (seed=777): at 4-bit ctx>=4096:
+        //   Standard: +29.6%, FlashLike: +2.1%, DeepLayer: -10.9%, Sparse: -7.2%
+        // The routing enables QJL at 4-bit+long-context based on aggregate expected benefit.
         let qjl_term = if use_qjl {
             if let (Some(ref corrections), Some(ref signs)) =
                 (&cache.qjl_corrections, &d_signs)
@@ -977,8 +982,10 @@ fn test_two_term_fused_attention() {
         println!("  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐");
         println!("  │ {:62} │", dist_name);
         println!("  ├──────────┬──────────────┬───────────────┬───────────────┬──────────────┬─────────────────┤");
-        println!("  │ seq_len │ MSE_cos   │ MSE_score_MSE│ TwoTerm_cos │ TT_score_MSE │ QJL_MSE_impv │");
-        println!("  ├──────────┼──────────────┼───────────────┼───────────────┼──────────────┼─────────────────┤");
+    // Routing legend: 2-bit/3-bit always MSE-only; 4-bit uses MSE-only when ctx<4096
+    // 0% improvement = routing skipped QJL; actual improvement only at 4-bit ctx>=4096
+    println!("  │ seq_len │ MSE_cos   │ MSE_score_MSE│ TwoTerm_cos │ TT_score_MSE │ QJL_MSE_impr │");
+    println!("  ├──────────┼──────────────┼───────────────┼───────────────┼──────────────┼─────────────────┤");
 
         for &test_len in &[256, 1024, 4096] {
             // Generate fresh keys for this test
@@ -1097,8 +1104,9 @@ fn test_two_term_fused_attention() {
     println!("  Note: QJL benefit is BITRATE-DEPENDENT: 4-bit shows best improvement, 2-bit degrades.\n");
     println!("  QJL is an UNBIASED estimator — it reduces expected error, not worst-case error.\n");
     println!("  At high error (2-bit): injected noise > correction benefit → QJL hurts.\n");
-    println!("  At low error (4-bit): correction > injected noise → QJL helps.\n");
-    println!("  RECOMMENDATION: Enable QJL at 4-bit, disable at 2-3bit for best accuracy.\n");
+    println!("  At low error (4-bit ctx>=4096): helps Standard (+29.6%%) but hurts DeepLayer (-10.9%%).\n");
+    println!("  Routing: QJL enabled at 4-bit ctx>=4096, disabled otherwise. Aggregate benefit is positive.\n");
+    println!("  RECOMMENDATION: Enable QJL at 4-bit ctx>=4096, disable at 2-3bit or ctx<4096.\n");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1469,13 +1477,17 @@ fn print_summary() {
     println!("  ┌─────────────────────────────────────────────────────────────────────────────┐");
     println!("  │ QJL ADAPTIVE ROUTING RULES                                                 │");
     println!("  ├─────────────────────────────────────────────────────────────────────────────┤");
-    println!("  │ Enable QJL (Two-term) only when:                                          │");
-    println!("  │   bits == 4  AND  context_length >= 4096                                  │");
-    println!("  │ Benefit: +29.6% score MSE improvement (Standard), +2.1% (FlashLike)    │");
-    println!("  │ Otherwise: skip QJL, use MSE-only fused attention (safer)                │");
+    println!("  │ Enable QJL only when: bits == 4 AND context_length >= 4096           │");
     println!("  │                                                                          │");
+    println!("  │ Section 13 data at 4-bit ctx>=4096:                                     │");
+    println!("  │   Standard:   +29.6%% (helps)                                           │");
+    println!("  │   FlashLike:  +2.1%% (marginal)                                        │");
+    println!("  │   DeepLayer: -10.9%% (hurts)                                           │");
+    println!("  │   Sparse:     -7.2%% (hurts)                                           │");
+    println!("  │                                                                          │");
+    println!("  │ Aggregate is positive — routing enables QJL based on expected benefit   │");
+    println!("  │ Otherwise: skip QJL, use MSE-only fused attention                       │");
     println!("  │ Implementation: fused_attention_two_term() with context_length param     │");
-    println!("  │ The routing is baked into the fused attention entry point                │");
     println!("  └─────────────────────────────────────────────────────────────────────────────┘\n");
 
     println!("  ┌─────────────────────────────────────────────────────────────────────────────┐");
