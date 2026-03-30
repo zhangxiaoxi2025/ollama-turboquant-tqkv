@@ -25,7 +25,7 @@ cd ollama-turboquant-tqkv
 # Run the primary benchmark (tq-kv, GGUF-optimized)
 cargo run --release -p bench-tqkv
 
-# Run comprehensive benchmark (11 test sections: distribution sensitivity, softmax accuracy, QJL scaling, etc.)
+# Run comprehensive benchmark (15 test sections: distribution sensitivity, softmax accuracy, QJL scaling, adaptive two-term attention, synthetic perplexity, etc.)
 cargo run --release -p bench-comprehensive
 
 # Run comparison benchmark (turbo-quant, general-purpose)
@@ -62,9 +62,9 @@ ollama-turboquant-tqkv/
 ├── Cargo.toml              # Rust workspace configuration
 ├── README.md
 ├── .gitignore
-├── bench-comprehensive/    # Extended benchmark (11 test sections)
+├── bench-comprehensive/    # Extended benchmark (15 test sections)
 │   ├── Cargo.toml
-│   └── src/main.rs        # distribution sensitivity, softmax accuracy, QJL scaling...
+│   └── src/main.rs        # compression, distribution, softmax, QJL, perplexity...
 ├── bench-tqkv/            # Primary benchmark suite (RECOMMENDED)
 │   ├── Cargo.toml
 │   └── src/main.rs        # tq-kv integration, fused attention, accuracy tests
@@ -122,16 +122,16 @@ All tests run on Apple Silicon (ARM64) at release optimization level.
 
 **Note**: fused_attention_scores bypasses QJL correction for maximum throughput. Use decompress_keys for QJL-corrected results at lower throughput.
 
-### Attention Score Accuracy (vs FP32 dot product, balanced 4-bit, QJL adaptive)
+### Attention Score Accuracy (vs FP32 dot product, balanced 4-bit, adaptive QJL)
 
-| Sequence Length | QJL Mode | KL Divergence | Top-1 Accuracy | Top-5 Accuracy |
-|-----------------|----------|---------------|----------------|--------------|
-| 256 tokens | OFF | 0.042 | 100% | 100% |
-| 1,024 tokens | OFF | 0.176 | ~50% | 100% |
-| 4,096 tokens | ON | 0.010 | 100% | 100% |
-| 16,384 tokens | ON | 0.047 | 100% | 100% |
+| Sequence Length | QJL Mode | KL Divergence | Top-1 Accuracy | Quality |
+|----------------|----------|---------------|----------------|---------|
+| 256 tokens | OFF | 0.039 | 86.7% | Acceptable |
+| 1,024 tokens | OFF | 0.045 | 84.4% | Acceptable |
+| 4,096 tokens | ON (+29.6%) | 0.045 | 82.9% | Acceptable |
+| 16,384 tokens | ON | 0.053 | — | Acceptable |
 
-**Note**: QJL activates at seq_len >= 4096 (threshold=4096). Short context (< 4K) skips QJL — quantization error is too small to benefit from error correction. Long context benefits from QJL's ~4.5 dB SNR improvement. Top-1 accuracy varies with query-key distribution; QJL consistently recovers 100% at long context.
+**Routing logic**: QJL activates at `bits == 4 AND context_length >= 4096`. Short context skips QJL — the variance cost of QJL sketches outweighs error correction benefit. At 4-bit + 4K+ tokens, QJL delivers +29.6% MSE improvement on Standard distributions (but may harm DeepLayer/Sparse by -7% to -11%, which the adaptive routing accepts for aggregate benefit).
 
 ### Model Memory Analysis (Qwen2.5-7B: 40 layers, 32 KV heads, head_dim=128)
 
@@ -143,25 +143,34 @@ All tests run on Apple Silicon (ARM64) at release optimization level.
 | 8,192 tokens | 5,120 MB | 1,360 MB | 3.8x | 3,760 MB |
 | 16,384 tokens | 10,240 MB | 2,720 MB | 3.8x | 7,520 MB |
 
-### QJL Adaptive Threshold Analysis
+### Adaptive QJL Two-Term Fused Attention
 
-| Sequence Length | QJL Mode | Recommendation |
-|----------------|----------|---------------|
-| < 4,096 tokens | OFF | Short context: QJL variance cost exceeds error correction benefit |
-| 4,096+ tokens | ON | Long context: accumulated quantization error outweighs variance |
+The two-term fused attention formula combines MSE term (codebook centroid projection) with an optional QJL term (unbiased residual sketch):
+
+```
+score_i = <rotated_q, centroids_i> + alpha * <rotated_q, H @ D @ signs_i>
+```
+
+| Condition | Mode | QJL Effect |
+|-----------|------|------------|
+| bits < 4 (2-bit, 3-bit) | MSE-only | QJL disabled — negative effect on low-bit distributions |
+| bits == 4, ctx < 4096 | MSE-only | QJL disabled — variance cost exceeds benefit |
+| bits == 4, ctx >= 4096 | Two-term | QJL +29.6% MSE improvement on Standard |
+
+**Distribution-aware note**: QJL improves Standard/FlashLike but harms DeepLayer/Sparse even at 4-bit ctx>=4096. The routing makes a conservative aggregate trade-off (Standard is the most common distribution in practice).
 
 ### Key Findings
 
 1. **head_dim=128**: optimal bits=4, break-even at ~175 tokens/layer (4-bit)
 2. **GQA models benefit most**: 8:1 KV head ratio → KV cache is 3.8x smaller
-3. **Softmax Top-1 accuracy**: 100% for 4-bit+QJL ON at seq_len ≥ 4K; 0–100% at shorter sequences
-4. **KL divergence**: 0.01–0.05 for 4-bit+QJL at long context, 0.04–0.18 without QJL
-5. **QJL effect**: KL drops ~4x at 4K+ tokens when QJL activates
-6. **DeepLayer distribution**: higher error, still acceptable at 4-bit
-7. **SinkToken pattern**: tq-kv handles sink tokens correctly
-8. **Numerical stability**: handles NaN/Inf gracefully (does not panic)
-9. **vs Naive quantization**: tq-kv 5–8x better cos_err at same bits (84–98% rel_err improvement)
-10. **API note**: `fused_attention_scores` bypasses QJL correction for throughput; use `decompress_keys` for QJL-corrected results
+3. **KL divergence by bit-width**: 2-bit ≈ 0.48–0.72, 3-bit ≈ 0.15–0.22, 4-bit ≈ 0.04–0.06
+4. **Top-1 accuracy by bit-width**: 2-bit ≈ 48–66%, 3-bit ≈ 68–74%, 4-bit ≈ 83–87%
+5. **QJL effect**: MSE score improvement +29.6% on Standard at 4-bit ctx=4096; KL domain improvement ~1% (marginal)
+6. **Adaptive routing**: QJL enables at 4-bit ctx>=4096, disabled otherwise — prevents negative effect on 2/3-bit and short-context
+7. **DeepLayer distribution**: higher error than Standard, still acceptable at 4-bit
+8. **Sparse distribution**: most challenging (KL ≈ 0.07–0.15 at 4-bit), accuracy degrades at long context
+9. **Numerical stability**: KL divergence handles zero/NaN gracefully; cosine similarity clamped to [-1, 1]
+10. **vs Naive quantization**: tq-kv 5–8x better cos_err at same bits (84–98% rel_err improvement)
 
 ## Integration Roadmap
 
