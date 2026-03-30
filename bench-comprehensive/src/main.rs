@@ -312,21 +312,35 @@ fn test_context_scaling() {
 // SECTION 5: SOFTMAX ACCURACY ANALYSIS
 // ═══════════════════════════════════════════════════════════
 
+/// Numerically stable softmax (f32).
+/// Handles empty input, zero sum, and NaN sum gracefully.
 fn softmax(v: &[f32]) -> Vec<f32> {
+    if v.is_empty() { return vec![]; }
     let max_v = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = v.iter().map(|&x| (x - max_v).exp()).sum();
-    v.iter().map(|&x| (x - max_v).exp() / sum).collect()
+    let exps: Vec<f32> = v.iter().map(|&x| (x - max_v).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    if sum == 0.0 || sum.is_nan() { return vec![1.0 / v.len() as f32; v.len()]; }
+    exps.iter().map(|e| e / sum).collect()
 }
 
+/// KL(P || Q) = sum_i p_i * log(p_i / q_i).
+/// Safe against -inf/NaN:
+///   - Skips terms where q_i ≈ 0 (log(p_i/0) would be +inf)
+///   - Skips terms where p_i ≈ 0 (0 * -inf would be NaN, but 0 * anything should be 0)
+///   - Uses f64 for accumulation to reduce floating-point error.
 fn kl_divergence(p: &[f32], q: &[f32]) -> f32 {
-    let eps = 1e-10;
-    p.iter().zip(q.iter())
-        .map(|(pi, &qi)| {
-            let pi = pi.max(eps);
-            let qi = qi.max(eps);
-            pi * (pi / qi).ln()
-        })
-        .sum()
+    let eps = 1e-15_f32;
+    let mut sum = 0.0_f64;
+    for (&pi, &qi) in p.iter().zip(q.iter()) {
+        if pi <= eps || qi <= eps {
+            continue;
+        }
+        let term = pi as f64 * ((pi as f64) / (qi as f64)).ln();
+        if !term.is_nan() && !term.is_infinite() {
+            sum += term;
+        }
+    }
+    sum as f32
 }
 
 fn test_softmax_accuracy() {
@@ -862,19 +876,19 @@ fn qjl_dot_term(
 /// Adaptive fused attention with conditional QJL routing.
 ///
 /// Routing logic:
-///   • bits == 4 AND context_length >= 4096 → Two-term (MSE + QJL): see Section 13 data
-///   • bits < 4 (2-bit, 3-bit)              → MSE-only: QJL disabled (see Section 13 for why)
-///   • bits == 4 AND context_length < 4096  → MSE-only: QJL compute not worth it
+///   • bits == 4 AND context_length >= 4096 → Two-term (MSE + QJL): +29.6% on Standard
+///   • bits < 4 (2-bit, 3-bit)              → MSE-only: QJL disabled, avoids negative effect
+///   • bits == 4 AND context_length < 4096  → MSE-only: QJL not worth compute cost
 ///
 /// Section 13 benchmark data (seed=777):
-///   2-bit:  QJL always disabled  → routing correctly skips QJL
-///   3-bit:  QJL always disabled  → routing correctly skips QJL
-///   4-bit ctx < 4096: QJL disabled → routing correctly skips QJL
-///   4-bit ctx >= 4096: QJL enabled → Standard: +29.6%, DeepLayer: -10.9%, Sparse: -7.2%
+///   2-bit:  QJL always disabled  (routing skips QJL)
+///   3-bit:  QJL always disabled  (routing skips QJL)
+///   4-bit ctx < 4096: QJL disabled (routing skips QJL)
+///   4-bit ctx >= 4096: QJL enabled  (Standard: +29.6%, DeepLayer: -10.9%, Sparse: -7.2%)
 ///
-/// Note: QJL improves Standard but HARMS DeepLayer/Sparse even at 4-bit.
-/// The routing enables QJL on the 4-bit+long-context sweet spot based on expected
-/// aggregate benefit. For production, per-layer distribution estimation could refine this.
+/// Note: QJL helps on Standard/FlashLike but HARMS DeepLayer/Sparse even at 4-bit.
+/// The routing enables QJL at 4-bit+long-context based on expected aggregate benefit.
+/// For production, consider per-layer distribution estimation to further refine routing.
 fn fused_attention_two_term(
     rotated_q: &[f32],
     cache: &CompressedKeys,
@@ -1246,8 +1260,8 @@ fn test_perplexity_simulation() {
                     let quant_scores = &all_fused[q_idx][..q_idx];
                     if quant_scores.iter().map(|x| x.powi(2)).sum::<f32>().sqrt() < 1e-6 { continue; }
 
-                    let orig_probs = softmax_stable(&orig_scores);
-                    let quant_probs = softmax_stable(quant_scores);
+                    let orig_probs = softmax(&orig_scores);
+                    let quant_probs = softmax(quant_scores);
 
                     let kl = kl_divergence(&orig_probs, &quant_probs);
                     let ppl = ppl_from_probs(&orig_probs);
@@ -1413,14 +1427,6 @@ fn test_perplexity_simulation() {
 }
 
 /// Numerically stable softmax (f32)
-fn softmax_stable(scores: &[f32]) -> Vec<f32> {
-    if scores.is_empty() { return vec![]; }
-    let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    if sum == 0.0 || sum.is_nan() { return vec![1.0 / scores.len() as f32; scores.len()]; }
-    exps.iter().map(|e| e / sum).collect()
-}
 
 /// Perplexity from probability distribution
 fn ppl_from_probs(probs: &[f32]) -> f64 {
@@ -1521,8 +1527,8 @@ fn analyze_errors(ref_s: &[f32], tq_s: &[f32]) -> (f32, f32, f32, f32, f32) {
 
         let norm_r = ref_s[i].powi(2).sqrt().max(1e-6);
         let norm_t = tq_s[i].powi(2).sqrt().max(1e-6);
-        let cos = ref_s[i] * tq_s[i] / (norm_r * norm_t);
-        cos_err_sum += (1.0 - cos).abs();
+        let cos = (ref_s[i] * tq_s[i] / (norm_r * norm_t)).clamp(-1.0, 1.0);
+        cos_err_sum += (1.0_f32 - cos).abs();
     }
 
     let n = ref_s.len() as f32;
