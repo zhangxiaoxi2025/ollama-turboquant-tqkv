@@ -1,16 +1,20 @@
 # Ollama TurboQuant KV Cache Benchmark
 
+> **⚠️ Current Status: Benchmark / Integration Proposal**
+>
+> This project evaluates TurboQuant-based KV cache compression through synthetic benchmarks and interface design. **It does NOT yet include backend integration** into Ollama or llama.cpp. Key results are based on synthetic data (random KV/query vectors, modeled distributions), not real model runs. See [Scope & Limitations](#scope--limitations) for details.
+
 A comprehensive benchmarking suite evaluating TurboQuant-based KV cache compression algorithms for potential integration into Ollama's llama.cpp inference engine.
 
 ## Overview
 
 Large language model inference with long context windows faces a critical memory bottleneck: the KV cache. As context length grows, the memory required to store key-value activations scales linearly, often exceeding the model weights themselves. This project benchmarks two Rust implementations of the TurboQuant algorithm (ICLR 2026) to evaluate their effectiveness in reducing KV cache memory footprint while maintaining inference quality.
 
-**Key results:**
+**Key results (synthetic benchmark):**
 - **3.8x memory reduction** for KV cache at 4-bit quantization (vs FP16)
 - **6M+ fused attention operations/sec** — no decompression required
-- **KL divergence < 0.05** for 4-bit+QJL at long context — negligible impact on generation quality
-- **Adaptive QJL** automatically enables error correction above 4K tokens
+- **KL divergence ≈ 0.04–0.05** for 4-bit at long context — from synthetic softmax distributions
+- **Adaptive QJL** routing: enables error correction at 4-bit ctx>=4096
 
 ## Quick Start
 
@@ -171,6 +175,26 @@ score_i = <rotated_q, centroids_i> + alpha * <rotated_q, H @ D @ signs_i>
 8. **Sparse distribution**: most challenging (KL ≈ 0.07–0.15 at 4-bit), accuracy degrades at long context
 9. **Numerical stability**: KL divergence handles zero/NaN gracefully; cosine similarity clamped to [-1, 1]
 10. **vs Naive quantization**: tq-kv 5–8x better cos_err at same bits (84–98% rel_err improvement)
+
+## Scope & Limitations
+
+### What this project IS
+
+- A **synthetic benchmark** evaluating tq-kv compression ratios, throughput, and attention score accuracy using random vectors and modeled distributions (Standard, DeepLayer, Sparse, FlashLike, SinkToken, PrefixCaching)
+- An **integration proposal** documenting the FFI interface, llama.cpp integration points, and Ollama CLI/API changes needed
+- A **validation framework** for the tq-kv library's correctness and numerical stability
+
+### What this project is NOT
+
+- ❌ **Backend integration**: KV cache compression is NOT yet implemented in Ollama or llama.cpp
+- ❌ **Real model validation**: No perplexity, RULER, or LongBench results from actual GGUF models
+- ❌ **Prefill-phase optimization**: Results focus on decode-phase KV cache access patterns
+- ❌ **V-cache compression**: Currently K-only; V-cache treatment is not implemented
+- ❌ **Production-ready**: No CI on real model runs, no regression testing on quality metrics
+
+### Target scenario
+
+GGUF Q4_K_M quantized models (e.g., Qwen2.5, Llama3) running on Ollama with GQA architectures, where KV heads << query heads. The decode-phase KV cache is the primary compression target.
 
 ## Integration Roadmap
 
