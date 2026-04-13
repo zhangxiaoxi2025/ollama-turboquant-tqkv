@@ -412,11 +412,11 @@ fn test_rope_compatibility() {
     let improvement = fused_mean / decomp_mean.max(1e-6);
 
     println!(
-        "  │ fused_attention  │ {:.4} ± {:.4}        │ DO NOT USE for RoPE!      │",
+        "  │ fused_attention  │ {:.4} ± {:.4}        │ higher cos_err              │",
         fused_mean, fused_std
     );
     println!(
-        "  │ decomp+dot       │ {:.4} ± {:.4}        │ USE THIS for RoPE ✓      │",
+        "  │ decomp+dot       │ {:.4} ± {:.4}        │ lower cos_err               │",
         decomp_mean, decomp_std
     );
     println!(

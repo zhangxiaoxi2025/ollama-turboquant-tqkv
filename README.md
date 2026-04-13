@@ -128,7 +128,7 @@ Real LLMs (Qwen2.5, Llama3, Mistral) use Rotary Position Embedding (RoPE). This 
 
 **P1 Fix — Verified Solution:**
 - **New API**: `rope_compatible_attention(q_rope, &cache, scale)` — uses `decompress_keys` + manual dot product
-- **Result**: Reduces cos_err from 0.2250 to **0.0002** (1099x improvement)
+- **Result**: Reduces cos_err on structured RoPE vectors via decompress approach
 - **Trade-off**: Loses fused attention speed advantage, but guarantees correct RoPE attention
 
 **Test Scenarios (8 total):**
@@ -136,8 +136,8 @@ Real LLMs (Qwen2.5, Llama3, Mistral) use Rotary Position Embedding (RoPE). This 
 |------|--------|---------|------------|
 | A | No-RoPE baseline | 0.0046 | Quantization only (acceptable) |
 | B | RoPE random vectors | 0.0045 | Random masks the problem |
-| E | RoPE structured vectors (fused) | **0.2250** | **INCOMPATIBLE** |
-| H | RoPE structured (decompress+dot) | **0.0002** | **CORRECT** |
+| E | RoPE structured vectors (fused) | ~0.22 | Higher on structured data |
+| H | RoPE structured (decompress+dot) | varies | Depends on dataset |
 | C | inverse-RoPE pre-rotation | 0.6289 | Makes it worse |
 
 **Implementation:**
@@ -225,10 +225,10 @@ score_i = <rotated_q, centroids_i> + alpha * <rotated_q, H @ D @ signs_i>
 10. **vs Naive quantization**: tq-kv 5–8x better cos_err at same bits (84–98% rel_err improvement)
 11. **RoPE compatibility: RESOLVED via decompress approach**
     - Problem: Hadamard and RoPE do NOT commute: `<H·RoPE(q), H·RoPE(k)> ≠ <RoPE(q), RoPE(k)>`
-    - Fused attention cos_err: 0.2250 on structured RoPE vectors (INCOMPATIBLE)
+    - Fused attention shows higher cos_err on structured RoPE vectors (~0.22)
     - **Fix**: `rope_compatible_attention()` uses decompress + manual dot product
-    - **Result**: cos_err reduced to 0.0002 (1099x improvement)
-    - Trade-off: Loses fused attention speed, but guarantees correct RoPE attention
+    - **Result**: cos_err varies by dataset; see `rope_proof.rs` for detailed comparison
+    - Trade-off: Loses fused attention speed advantage
 
 ## Scope & Limitations
 
@@ -269,9 +269,9 @@ GGUF Q4_K_M quantized models (e.g., Qwen2.5, Llama3) running on Ollama with GQA 
 - `bench-tqkv/src/main.rs` — Added `apply_rope()`, `rope_compatible_attention()`, `test_rope_compatibility()`
 
 **Results:**
-- Fused attention cos_err on RoPE structured vectors: **0.2250** (INCOMPATIBLE)
-- Decompress+dot cos_err: **0.0002** (CORRECT — 1099x better)
-- Verified: `pre_rotate_query + inverse_RoPE` makes it WORSE (0.6289)
+- Fused attention cos_err on RoPE structured vectors: ~0.22
+- Decompress+dot cos_err: varies by dataset (see `rope_proof.rs` for details)
+- Verified: `pre_rotate_query + inverse_RoPE` makes it worse (0.6289)
 
 ### Open Issues
 
