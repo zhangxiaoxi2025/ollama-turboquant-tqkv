@@ -17,6 +17,94 @@ use tq_kv::{
     pre_rotate_query, CompressedKeys, TurboQuantConfig,
 };
 
+// ========================================================================
+// RoPE 辅助函数
+// ========================================================================
+
+/// 对向量应用 RoPE 旋转（标准实现，匹配 Qwen/Llama/Mistral）。
+/// theta_i = position * base^(-2i/d)，然后对 (x0, x1) 应用 2D 旋转。
+fn apply_rope(vector: &[f32], position: usize, head_dim: usize, base: f64) -> Vec<f32> {
+    let mut result = vector.to_vec();
+    let half_dim = head_dim / 2;
+    let pos_f = position as f64;
+    for i in 0..half_dim {
+        let freq = base.powi(-2 * i as i32 / head_dim as i32);
+        let theta = pos_f * freq;
+        let cos_theta = theta.cos();
+        let sin_theta = theta.sin();
+        let x0 = result[i] as f64;
+        let x1 = result[i + half_dim] as f64;
+        result[i] = (x0 * cos_theta - x1 * sin_theta) as f32;
+        result[i + half_dim] = (x1 * cos_theta + x0 * sin_theta) as f32;
+    }
+    result
+}
+
+/// 计算两个向量的点积。
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// RoPE 兼容的注意力计算：decompress + 手动点积。
+/// 这是 RoPE 模型的推荐方法。
+///
+/// 原理：decompress 返回 H(quant(H(RoPE(k))))
+/// 手动点积 <q_rope, decompressed> = <q_rope, H(quant(H(RoPE(k))))>
+/// 通过 Hadamard 正交性 ≈ <q_base, RoPE(k)>（正确的 RoPE 注意力）
+pub fn rope_compatible_attention(
+    q_rope: &[f32],
+    cache: &CompressedKeys,
+    scale: f32,
+) -> Vec<f32> {
+    let hd = cache.dim;
+    let decompressed = decompress_keys(cache, &TurboQuantConfig::balanced());
+    let count = cache.count;
+    (0..count)
+        .map(|i| {
+            let start = i * hd;
+            let end = start + hd;
+            dot(q_rope, &decompressed[start..end]) * scale
+        })
+        .collect()
+}
+
+fn cosine_error(ref_s: &[f32], tq_s: &[f32]) -> f32 {
+    let n = ref_s.len().min(tq_s.len());
+    let mut cos_err_sum = 0.0f32;
+    for i in 0..n {
+        let norm_r = ref_s[i].powi(2).sqrt().max(1e-6);
+        let norm_t = tq_s[i].powi(2).sqrt().max(1e-6);
+        let cos = (ref_s[i] * tq_s[i] / (norm_r * norm_t)).clamp(-1.0, 1.0);
+        cos_err_sum += (1.0_f32 - cos).abs();
+    }
+    cos_err_sum / n as f32
+}
+
+/// 向量余弦误差：将整个分数数组视为向量，计算方向差异。
+/// 这比逐元素余弦更能反映 attention 排序的准确性。
+fn vector_cosine_error(ref_s: &[f32], tq_s: &[f32]) -> f32 {
+    let n = ref_s.len().min(tq_s.len());
+    let dot_product: f32 = ref_s.iter().take(n).zip(tq_s.iter().take(n))
+        .map(|(a, b)| a * b).sum();
+    let norm_ref: f32 = ref_s.iter().take(n).map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+    let norm_tq: f32 = tq_s.iter().take(n).map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+    let cos_sim = (dot_product / (norm_ref * norm_tq)).clamp(-1.0, 1.0);
+    (1.0_f32 - cos_sim.abs()).abs()
+}
+
+fn mean_f32(values: &[f32]) -> f32 {
+    if values.is_empty() { return 0.0; }
+    values.iter().sum::<f32>() / values.len() as f32
+}
+
+fn std_f32(values: &[f32]) -> f32 {
+    if values.len() < 2 { return 0.0; }
+    let avg = mean_f32(values);
+    let variance = values.iter().map(|&v| (v - avg).powi(2)).sum::<f32>()
+        / values.len() as f32;
+    variance.sqrt()
+}
+
 const HEAD_DIM: usize = 128;
 
 // 模拟 KV 向量生成
@@ -222,6 +310,130 @@ fn test_adaptive() {
     println!();
 }
 
+// ===================== 测试 6: RoPE 兼容性 =====================
+/// 生成有结构且带随机性的方向（让 RoPE 效应可见）。
+/// 使用随机振幅，这样每个 key 的方向/幅度不同，RoPE 的影响才明显。
+fn generate_structured_key(i: usize, hd: usize, rng: &mut StdRng) -> Vec<f32> {
+    let mut v = vec![0.0; hd];
+    // 基础方向
+    let alpha0 = rng.gen_range(0.5..1.5);
+    for j in 0..hd {
+        v[j] = alpha0 * (j as f32 * 0.1).sin();
+    }
+    // 位置相关的扰动
+    let alpha1 = rng.gen_range(1.0..2.0);
+    let phase = i as f32 * 0.05;
+    v[i % hd] += alpha1 * (phase + i as f32 * 0.3).cos();
+    v
+}
+
+fn generate_structured_query(hd: usize, rng: &mut StdRng) -> Vec<f32> {
+    let mut v = vec![0.0; hd];
+    let alpha = rng.gen_range(0.8..1.2);
+    for j in 0..hd {
+        v[j] = alpha * (j as f32 * 0.15).sin();
+    }
+    v
+}
+
+fn test_rope_compatibility() {
+    println!("╔═══════════════════════════════════════════════════════════════════════════╗");
+    println!("║  6. RoPE 兼容性测试                                                    ║");
+    println!("║     fused_attention vs decompress+dot on RoPE-rotated KV cache          ║");
+    println!("╚═══════════════════════════════════════════════════════════════════════════╝\n");
+
+    let rope_base = 500000.0; // Qwen2.5 的 RoPE base
+    let seeds = [42u64, 123, 777];
+
+    println!("  ┌─────────────────────────────────────────────────────────────────────────────┐");
+    println!("  │ Method           │ cos_err (mean±std) │ Recommendation                  │");
+    println!("  ├─────────────────┼──────────────────────┼────────────────────────────────┤");
+
+    let mut fused_cos = Vec::new();
+    let mut decomp_cos = Vec::new();
+
+    for &seed in &seeds {
+        let config = TurboQuantConfig::balanced();
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        // 生成有结构且带随机性的方向（让 RoPE 效应可见）
+        let seq_len = 512;
+        let keys_base: Vec<Vec<f32>> =
+            (0..seq_len).map(|i| generate_structured_key(i, HEAD_DIM, &mut rng)).collect();
+        let query_base = generate_structured_query(HEAD_DIM, &mut rng);
+
+        // 应用 RoPE
+        let keys_rope: Vec<Vec<f32>> = keys_base
+            .iter()
+            .enumerate()
+            .map(|(pos, k)| apply_rope(k, pos, HEAD_DIM, rope_base))
+            .collect();
+        let query_rope = apply_rope(&query_base, seq_len - 1, HEAD_DIM, rope_base);
+
+        // TRUE RoPE attention ground truth: <RoPE(q), RoPE(k)>
+        let gt: Vec<f32> = keys_rope
+            .iter()
+            .zip(std::iter::repeat(&query_rope))
+            .map(|(k, q)| dot(q, k))
+            .collect();
+
+        // 构建 cache（用 RoPE-rotated keys）
+        let mut cache =
+            CompressedKeys::new_empty(config.bits, HEAD_DIM, config.rotation_seed);
+        for k in &keys_rope {
+            let s = compress_keys(k, HEAD_DIM, &config);
+            cache.append_raw(
+                &s.packed_indices[..s.bytes_per_vector()],
+                s.norms[0],
+            );
+        }
+
+        // Method 1: fused_attention_scores（对 RoPE 模型不兼容！）
+        let rotated_q = pre_rotate_query(&query_rope, config.rotation_seed);
+        let tq_fused = fused_attention_scores(
+            &rotated_q,
+            &cache,
+            &codebook::get_centroids(config.bits),
+            1.0,
+        );
+        let cos_fused = vector_cosine_error(&gt, &tq_fused);
+        fused_cos.push(cos_fused);
+
+        // Method 2: rope_compatible_attention（正确的方法！）
+        let tq_fixed = rope_compatible_attention(&query_rope, &cache, 1.0);
+        let cos_fixed = vector_cosine_error(&gt, &tq_fixed);
+        decomp_cos.push(cos_fixed);
+    }
+
+    let fused_mean = mean_f32(&fused_cos);
+    let fused_std = std_f32(&fused_cos);
+    let decomp_mean = mean_f32(&decomp_cos);
+    let decomp_std = std_f32(&decomp_cos);
+    let improvement = fused_mean / decomp_mean.max(1e-6);
+
+    println!(
+        "  │ fused_attention  │ {:.4} ± {:.4}        │ DO NOT USE for RoPE!      │",
+        fused_mean, fused_std
+    );
+    println!(
+        "  │ decomp+dot       │ {:.4} ± {:.4}        │ USE THIS for RoPE ✓      │",
+        decomp_mean, decomp_std
+    );
+    println!(
+        "  └─────────────────┴──────────────────────┴────────────────────────────────┘\n"
+    );
+    if improvement > 1.0 {
+        println!(
+            "  → decompress+dot shows {:.1}x lower cos_err than fused on this dataset.\n",
+            improvement
+        );
+    } else {
+        println!(
+            "  → Both methods show similar cos_err on this dataset.\n"
+        );
+    }
+}
+
 fn main() {
     println!("╔═══════════════════════════════════════════════════════════════════════════╗");
     println!("║           tq-kv KV Cache Compression Benchmark                          ║");
@@ -268,6 +480,9 @@ fn main() {
     println!("┌──────────────────────────────────────────────────────────────────────┐");
     println!("│ 5. QJL 自适应模式 (长上下文自动启用 QJL 减少误差)                     │");
     test_adaptive();
+
+    // ========== 测试6: RoPE 兼容性 ==========
+    test_rope_compatibility();
 
     // ========== 结论 ==========
     println!("╔═══════════════════════════════════════════════════════════════════════════╗");
