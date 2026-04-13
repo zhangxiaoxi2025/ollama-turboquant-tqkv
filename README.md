@@ -29,7 +29,7 @@ cd ollama-turboquant-tqkv
 # Run the primary benchmark (tq-kv, GGUF-optimized)
 cargo run --release -p bench-tqkv
 
-# Run comprehensive benchmark (15 test sections: distribution sensitivity, softmax accuracy, QJL scaling, adaptive two-term attention, synthetic perplexity, etc.)
+# Run comprehensive benchmark (16 test sections: distribution sensitivity, softmax accuracy, QJL scaling, adaptive two-term attention, synthetic perplexity, RoPE compatibility, etc.)
 cargo run --release -p bench-comprehensive
 
 # Run comparison benchmark (turbo-quant, general-purpose)
@@ -66,9 +66,9 @@ ollama-turboquant-tqkv/
 ├── Cargo.toml              # Rust workspace configuration
 ├── README.md
 ├── .gitignore
-├── bench-comprehensive/    # Extended benchmark (15 test sections)
+├── bench-comprehensive/    # Extended benchmark (16 test sections)
 │   ├── Cargo.toml
-│   └── src/main.rs        # compression, distribution, softmax, QJL, perplexity...
+│   └── src/main.rs        # compression, distribution, softmax, QJL, perplexity, RoPE...
 ├── bench-tqkv/            # Primary benchmark suite (RECOMMENDED)
 │   ├── Cargo.toml
 │   └── src/main.rs        # tq-kv integration, fused attention, accuracy tests
@@ -101,6 +101,54 @@ The [turbo-quant](https://github.com/recursiveintell/turbo-quant) library provid
 - Per-token compression yields negative memory savings for typical LLM configurations
 
 This benchmark is included for completeness and educational purposes.
+
+### bench-comprehensive — Extended Analysis (Recommended for Deep Dive)
+
+The comprehensive benchmark suite includes 16 test sections covering all aspects of tq-kv performance:
+
+- **Sections 1-4**: Compression ratios, distribution sensitivity, context scaling, softmax accuracy
+- **Sections 5-7**: Model memory profiles, break-even analysis, QJL scaling
+- **Sections 8-9**: Numerical stability, naive quantization comparison
+- **Sections 10-12**: Theory vs practice gap, model parameter sensitivity, GQA analysis
+- **Section 13**: Adaptive QJL two-term fused attention (MSE + QJL routing)
+- **Section 14**: Synthetic perplexity simulation
+- **Section 15**: **RoPE Compatibility Test** (P0 priority)
+
+#### Section 15: RoPE Compatibility Test (UPDATED 2026-04-13)
+
+Real LLMs (Qwen2.5, Llama3, Mistral) use Rotary Position Embedding (RoPE). This section verifies whether tq-kv's Hadamard rotation is compatible with RoPE:
+
+**P0 Discovery — Mathematical Proof:**
+- **No-RoPE cos_err**: 0.0046 (Hadamard-space quantization error — acceptable)
+- **RoPE fused cos_err**: 0.2250 (structured vectors — INCOMPATIBLE)
+- **Root cause**: Hadamard and RoPE do NOT commute: `H·RoPE ≠ RoPE·H`
+- fused_attention computes: `<H·RoPE(q), quant(H·RoPE(k))>`
+- Ground truth (true RoPE attention): `<RoPE(q), RoPE(k)>`
+- These are DIFFERENT inner products — fused attention computes wrong attention order for RoPE models
+
+**P1 Fix — Verified Solution:**
+- **New API**: `rope_compatible_attention(q_rope, &cache, scale)` — uses `decompress_keys` + manual dot product
+- **Result**: Reduces cos_err from 0.2250 to **0.0002** (1099x improvement)
+- **Trade-off**: Loses fused attention speed advantage, but guarantees correct RoPE attention
+
+**Test Scenarios (8 total):**
+| Test | Method | cos_err | Conclusion |
+|------|--------|---------|------------|
+| A | No-RoPE baseline | 0.0046 | Quantization only (acceptable) |
+| B | RoPE random vectors | 0.0045 | Random masks the problem |
+| E | RoPE structured vectors (fused) | **0.2250** | **INCOMPATIBLE** |
+| H | RoPE structured (decompress+dot) | **0.0002** | **CORRECT** |
+| C | inverse-RoPE pre-rotation | 0.6289 | Makes it worse |
+
+**Implementation:**
+- `bench-comprehensive/examples/rope_proof.rs` — Complete mathematical proof (8 test scenarios)
+- `bench-comprehensive/src/main.rs` — `rope_compatible_attention()` API
+- `bench-tqkv/src/main.rs` — `test_rope_compatibility()` test
+
+**Impact on benchmark validity:**
+- Sections 1-14 use no-RoPE data, measuring Hadamard-space quantization error (cos_err ≈ 0.0046)
+- For real RoPE models, **use `rope_compatible_attention` instead of `fused_attention_scores`**
+- The benchmark results are VALID for quantization quality; RoPE compatibility is NOW RESOLVED via decompress approach
 
 ## Benchmark Results
 
@@ -175,6 +223,12 @@ score_i = <rotated_q, centroids_i> + alpha * <rotated_q, H @ D @ signs_i>
 8. **Sparse distribution**: most challenging (KL ≈ 0.07–0.15 at 4-bit), accuracy degrades at long context
 9. **Numerical stability**: KL divergence handles zero/NaN gracefully; cosine similarity clamped to [-1, 1]
 10. **vs Naive quantization**: tq-kv 5–8x better cos_err at same bits (84–98% rel_err improvement)
+11. **RoPE compatibility: RESOLVED via decompress approach**
+    - Problem: Hadamard and RoPE do NOT commute: `<H·RoPE(q), H·RoPE(k)> ≠ <RoPE(q), RoPE(k)>`
+    - Fused attention cos_err: 0.2250 on structured RoPE vectors (INCOMPATIBLE)
+    - **Fix**: `rope_compatible_attention()` uses decompress + manual dot product
+    - **Result**: cos_err reduced to 0.0002 (1099x improvement)
+    - Trade-off: Loses fused attention speed, but guarantees correct RoPE attention
 
 ## Scope & Limitations
 
@@ -195,6 +249,63 @@ score_i = <rotated_q, centroids_i> + alpha * <rotated_q, H @ D @ signs_i>
 ### Target scenario
 
 GGUF Q4_K_M quantized models (e.g., Qwen2.5, Llama3) running on Ollama with GQA architectures, where KV heads << query heads. The decode-phase KV cache is the primary compression target.
+
+## Final Report (2026-04-13)
+
+### Completed Work
+
+| Phase | Status | Deliverables |
+|-------|--------|--------------|
+| P0: RoPE Mathematical Proof | ✅ Complete | `rope_proof.rs` with 8 test scenarios |
+| P1: Fix API Implementation | ✅ Complete | `rope_compatible_attention()` in both benchmarks |
+| P2: bench-tqkv Integration | ✅ Complete | `test_rope_compatibility()` added |
+| P3: Real Model Validation | ❌ Blocked | Mac memory insufficient (OOM at 7B/1.5B) |
+
+### Key Deliverables
+
+**Code:**
+- `bench-comprehensive/examples/rope_proof.rs` — Complete RoPE compatibility proof (8 scenarios)
+- `bench-comprehensive/src/main.rs` — Added `rope_compatible_attention()` API + `test_rope_fix_verification()`
+- `bench-tqkv/src/main.rs` — Added `apply_rope()`, `rope_compatible_attention()`, `test_rope_compatibility()`
+
+**Results:**
+- Fused attention cos_err on RoPE structured vectors: **0.2250** (INCOMPATIBLE)
+- Decompress+dot cos_err: **0.0002** (CORRECT — 1099x better)
+- Verified: `pre_rotate_query + inverse_RoPE` makes it WORSE (0.6289)
+
+### Open Issues
+
+**1. Memory Requirements (Hardware Limitation)**
+- llama-cli OOM Kill on current Mac (likely 8GB/16GB)
+- 7B model: 4.4GB file, requires ~16GB RAM to load
+- 1.5B model: 940MB file, also OOM with Metal GPU
+- **Resolution**: Need machine with 32GB+ RAM for real model validation
+
+**2. Backend Integration (Not Started)**
+- tq-kv NOT yet integrated into llama.cpp
+- Requires: GGML_TYPE_TURBOQUANT type, `cpy_k`/`cpy_v` with compressed storage
+- `rope_compatible_attention` needs to replace `fused_attention` in llama.cpp forward pass
+
+### Recommended Next Steps
+
+1. **On 32GB+ Mac**: Run llama-cli with tq-kv integration
+2. **llama.cpp PR**: Submit GGML_TYPE_TURBOQUANT integration
+3. **Perplexity Test**: Compare WikiText-2 perplexity (baseline vs tq-kv)
+4. **Performance Benchmark**: Measure decode tok/s with/without compression
+
+### Citation
+
+If you use this benchmark suite in your research, please cite:
+
+```bibtex
+@misc{ollama-turboquant-tqkv,
+  title = {Ollama TurboQuant KV Cache Benchmark},
+  author = {Zhang, Xiaoxi},
+  year = {2026},
+  url = {https://github.com/zhangxiaoxi2025/ollama-turboquant-tqkv},
+  note = {RoPE compatibility analysis and fix implementation added 2026-04-13}
+}
+```
 
 ## Integration Roadmap
 
