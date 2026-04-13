@@ -673,44 +673,37 @@ println!(
 );
 
 // =========================================================================
-// MATHEMATICAL INSIGHT (key to understanding the difference)
+// TEST H: decompress + manual dot (using SAME structured vectors as Test E)
 // =========================================================================
-//
-// Fused attention: <H(q), quant(H(RoPE(k))))>
-// = sum_i H(q)[i] * quant(H(RoPE(k))[i])
-// ≠ sum_i q[i] * H(RoPE(k))[i] (because Hadamard ≠ coordinate-wise)
-//
-// decompress+dot: <q, decompress>
-// = <q, H(quant(H(RoPE(k))))> = sum_i q[i] * H(quant(H(RoPE(k))))[i]
-// = sum_i q[i] * H(RoPE(k))[i] = <H(q), RoPE(k)> (by Hadamard orthogonality!)
-// = <H^{-1}(H(q)), k> = <q, k> (by Hadamard orthogonality)
-//
-// For structured vectors with non-uniform k_base:
-//   - Fused: mixes H(q) with quant(H(RoPE(k))) → WRONG
-//   - decompress+dot: recovers <q, k> = true RoPE attention → CORRECT!
-//
-// For random vectors:
-//   - Both: quantization error dominates, masking the difference
-//   - cos_err ≈ 0.0045 for both (random vectors average out the structure)
-//
-// THE KEY INSIGHT: Hadamard orthogonality (<H(x), y> = <x, H(y)>)
-// lets decompress+dot recover true RoPE attention, while fused cannot.
+// Using identical data generation as Test E for fair comparison.
+println!("\nTEST H: decompress + manual dot (same structured vectors as Test E)\n");
 
 let mut decomp_struct_cos = Vec::new();
 for &seed in &seeds {
     let config = TurboQuantConfig::balanced();
     let mut rng = StdRng::seed_from_u64(seed);
 
+    // SAME structured vector generation as Test E
     let keys_base: Vec<Vec<f32>> = (0..seq_len)
         .map(|i| {
             let mut v = vec![0.0; hd];
+            let alpha0 = rng.gen_range(0.5..1.5);
             for j in 0..hd {
-                v[j] = ((i + j) as f32 * 0.1).sin();
+                v[j] = alpha0 * (j as f32 * 0.1).sin();
             }
+            let alpha1 = rng.gen_range(1.0..2.0);
+            let phase = i as f32 * 0.05;
+            v[i % hd] += alpha1 * (phase + i as f32 * 0.3).cos();
             v
         })
         .collect();
-    let query_base = (0..hd).map(|j| (j as f32 * 0.15).sin()).collect::<Vec<_>>();
+    let query_base = {
+        let mut v = vec![0.0; hd];
+        for j in 0..hd {
+            v[j] = (j as f32 * 0.15).sin();
+        }
+        v
+    };
 
     let keys_rope: Vec<Vec<f32>> = keys_base
         .iter()
@@ -747,14 +740,14 @@ println!(
     mean(&struct_cos_fused_vs_rope)
 );
 
-if mean(&decomp_struct_cos) < 0.05 && mean(&struct_cos_fused_vs_rope) > 0.1 {
+if mean(&decomp_struct_cos) < mean(&struct_cos_fused_vs_rope) {
+    let ratio = mean(&struct_cos_fused_vs_rope) / mean(&decomp_struct_cos).max(1e-6);
     println!(
-        "  → decompress+dot is CORRECT for RoPE! {:.4}x better than fused ({:.4})",
-        mean(&struct_cos_fused_vs_rope) / mean(&decomp_struct_cos).max(1e-6),
-        mean(&decomp_struct_cos)
+        "  → decompress+dot shows {:.1}x lower cos_err than fused on this dataset.\n",
+        ratio
     );
 } else {
-    println!("  → decompress+dot vs fused: {:.4} vs {:.4}", mean(&decomp_struct_cos), mean(&struct_cos_fused_vs_rope));
+    println!("  → Both methods show similar cos_err on this dataset.\n");
 }
 
 // =========================================================================
@@ -767,30 +760,31 @@ println!("╚══════════════════════�
 let test_b_cos = mean(&rope_cos);
 let test_e_cos = mean(&struct_cos_fused_vs_rope);
 let test_g_cos = mean(&decomp_struct_cos);
+let improvement = test_e_cos / test_g_cos.max(1e-6);
 
 println!("  ┌─────────────────────────────────────────────────────────────────────────┐");
-println!("  │ EMPIRICAL RESULTS                                                       │");
+println!("  │ EMPIRICAL RESULTS (same structured vectors for all tests)              │");
 println!("  ├─────────────────────────────────────────────────────────────────────────┤");
 println!("  │ Test A (no-RoPE random):     cos_err = {:.4}  [quantization only]     │", mean(&no_rope_cos));
 println!("  │ Test B (RoPE random):         cos_err = {:.4}  [masked by randomness]  │", test_b_cos);
-println!("  │ Test E (RoPE structured):     cos_err = {:.4}  [FUSED IS INCOMPATIBLE] │", test_e_cos);
-println!("  │ Test C (inverse RoPE fix):    cos_err = {:.4}  [WORSE than baseline]   │", mean(&fix_cos));
-println!("  │ Test H (decompress+dot):    cos_err = {:.4}  [CORRECT FOR ROPE!]     │", test_g_cos);
+println!("  │ Test E (RoPE structured, fused): cos_err = {:.4}                     │", test_e_cos);
+println!("  │ Test C (inverse RoPE fix):    cos_err = {:.4}  [WORSE]               │", mean(&fix_cos));
+println!("  │ Test H (RoPE structured, decomp): cos_err = {:.4}                    │", test_g_cos);
 println!("  └─────────────────────────────────────────────────────────────────────────┘\n");
 
-println!("  ┌─────────────────────────────────────────────────────────────────────────┐");
-println!("  │ KEY FINDING: decompress+dot is CORRECT for RoPE (1099x better)          │");
-println!("  └─────────────────────────────────────────────────────────────────────────┘\n");
+if improvement > 1.0 {
+    println!("  ┌─────────────────────────────────────────────────────────────────────────┐");
+    println!("  │ KEY FINDING: decompress+dot shows {:.1}x lower cos_err than fused     │", improvement);
+    println!("  └─────────────────────────────────────────────────────────────────────────┘\n");
+}
 
 if test_e_cos > 0.1 {
     println!("  ┌─────────────────────────────────────────────────────────────────────────┐");
-    println!("  │ FUSED ATTENTION: INCOMPATIBLE with RoPE (cos_err={:.2})              │", test_e_cos);
+    println!("  │ FUSED ATTENTION: higher cos_err on RoPE structured vectors           │");
     println!("  └─────────────────────────────────────────────────────────────────────────┘\n");
     println!("  ┌─────────────────────────────────────────────────────────────────────────┐");
-    println!("  │ decompress_keys + manual dot: CORRECT (cos_err={:.4})                 │", test_g_cos);
+    println!("  │ decompress_keys + manual dot: lower cos_err on same data             │");
     println!("  └─────────────────────────────────────────────────────────────────────────┘\n");
-    let improvement = test_e_cos / test_g_cos.max(1e-6);
-    println!("  → decompress+dot is {:.0}x better than fused attention!              \n", improvement as i32);
 }
 
 println!("  ┌─────────────────────────────────────────────────────────────────────────┐");
@@ -808,25 +802,25 @@ println!("  │ WHY RANDOM BENCHMARKS MASKED THE PROBLEM:                       
 println!("  ├─────────────────────────────────────────────────────────────────────────┤");
 println!("  │ • Random vectors: <q,k> ≈ <H(q),H(k)> ≈ <RoPE(q),RoPE(k)>        │");
 println!("  │ • Quantization error dominates, masking Hadamard+RoPE mismatch     │");
-println!("  │ • Section 1-14 benchmarks use random vectors → fooled us!          │");
+println!("  │ • Section 1-14 benchmarks use random vectors                       │");
 println!("  └─────────────────────────────────────────────────────────────────────────┘\n");
 
 println!("  ┌─────────────────────────────────────────────────────────────────────────┐");
-println!("  │ RECOMMENDED FIX (simple, proven):                                     │");
+println!("  │ RECOMMENDED APPROACH: decompress + manual dot                         │");
 println!("  ├─────────────────────────────────────────────────────────────────────────┤");
 println!("  │ 1. Use decompress_keys(): get H(quant(H(RoPE(k))))              │");
 println!("  │ 2. Manual dot: <q_rope, decompressed>                             │");
-println!("  │ 3. cos_err = {:.4} (vs fused {:.2},  {:.0}x better)           │", test_g_cos, test_e_cos, (test_e_cos/test_g_cos.max(1e-6)) as i32);
+println!("  │ 3. cos_err = {:.4} (vs fused {:.2})                           │", test_g_cos, test_e_cos);
 println!("  │                                                                          │");
 println!("  │ Trade-off: loses fused attention speed advantage                     │");
-println!("  │ Benefit: correct RoPE-compatible attention                          │");
+println!("  │ Benefit: lower cos_err on structured RoPE vectors                    │");
 println!("  └─────────────────────────────────────────────────────────────────────────┘\n");
 
 println!("  ┌─────────────────────────────────────────────────────────────────────────┐");
-println!("  │ REJECTED APPROACHES:                                                  │");
+println!("  │ TESTED APPROACHES:                                                    │");
 println!("  ├─────────────────────────────────────────────────────────────────────────┤");
-println!("  │ pre_rotate_query + inverse RoPE: cos_err={:.2} (WORSE)         │", mean(&fix_cos));
-println!("  │ decompress + inverse RoPE:         cos_err≈1.0 (BROKEN)           │");
-println!("  │ Use fused attention as-is:        cos_err={:.2} (INCOMPATIBLE)   │", test_e_cos);
+println!("  │ pre_rotate_query + inverse RoPE: cos_err={:.2} (higher)        │", mean(&fix_cos));
+println!("  │ decompress + inverse RoPE:         cos_err≈1.0 (much higher)     │");
+println!("  │ fused attention as-is:             cos_err={:.2} (higher)       │", test_e_cos);
 println!("  └─────────────────────────────────────────────────────────────────────────┘\n");
 }

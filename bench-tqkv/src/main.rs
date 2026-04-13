@@ -46,7 +46,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// RoPE 兼容的注意力计算：decompress + 手动点积。
-/// 这是对 RoPE 模型正确的方法，比 fused_attention_scores 好 1000 倍。
+/// 这是 RoPE 模型的推荐方法。
 ///
 /// 原理：decompress 返回 H(quant(H(RoPE(k))))
 /// 手动点积 <q_rope, decompressed> = <q_rope, H(quant(H(RoPE(k))))>
@@ -422,10 +422,16 @@ fn test_rope_compatibility() {
     println!(
         "  └─────────────────┴──────────────────────┴────────────────────────────────┘\n"
     );
-    println!(
-        "  → decompress+dot 比 fused 好 {:.0}x！\n",
-        improvement as i32
-    );
+    if improvement > 1.0 {
+        println!(
+            "  → decompress+dot shows {:.1}x lower cos_err than fused on this dataset.\n",
+            improvement
+        );
+    } else {
+        println!(
+            "  → Both methods show similar cos_err on this dataset.\n"
+        );
+    }
 }
 
 fn main() {

@@ -2055,14 +2055,16 @@ fn test_rope_fix_verification() {
     println!("  ┌─────────────────────────────────────────────────────────────────────────┐");
     println!("  │ FIX SUMMARY                                                             │");
     println!("  ├─────────────────────────────────────────────────────────────────────────┤");
-    println!("  │ • fused_attention_scores: cos_err = {:.4} (INCOMPATIBLE with RoPE)  │", fused_mean);
-    println!("  │ • rope_compatible_attention: cos_err = {:.4} (CORRECT for RoPE)   │", decomp_mean);
-    println!("  │ • Improvement: {:.0}x better with decompress+dot method           │", improvement as i32);
+    println!("  │ • fused_attention_scores: cos_err = {:.4}                             │", fused_mean);
+    println!("  │ • rope_compatible_attention: cos_err = {:.4}                          │", decomp_mean);
+    if improvement > 1.0 {
+        println!("  │ • decompress+dot shows {:.1}x lower cos_err on this dataset          │", improvement);
+    }
     println!("  │                                                                          │");
     println!("  │ API: rope_compatible_attention(q_rope, &cache, scale)               │");
     println!("  │                                                                          │");
     println!("  │ Trade-off: loses fused attention speed advantage                     │");
-    println!("  │ Benefit: correct RoPE-compatible attention                          │");
+    println!("  │ Benefit: lower cos_err on structured RoPE vectors                    │");
     println!("  └─────────────────────────────────────────────────────────────────────────┘\n");
 }
 
